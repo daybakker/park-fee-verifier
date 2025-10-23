@@ -5,7 +5,6 @@ import Papa from 'papaparse';
 const ParkFeeVerifier = () => {
   const [inputMode, setInputMode] = useState('single');
   const [singleInput, setSingleInput] = useState('');
-  const [csvData, setCsvData] = useState(null);
   const [results, setResults] = useState([]);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
@@ -19,91 +18,28 @@ const ParkFeeVerifier = () => {
       .trim();
   };
 
-  const expandAbbreviations = (name) => {
-    if (!name) return name;
-    const expansions = {
-      'sp': 'state park',
-      'np': 'national park',
-      'sna': 'state natural area',
-      'nhp': 'national historical park',
-      'nf': 'national forest',
-      'nra': 'national recreation area',
-      'nwr': 'national wildlife refuge',
-      'shs': 'state historic site',
-      'shp': 'state historic park',
-      'mt': 'mount',
-      'mtn': 'mountain'
-    };
-    let expanded = name;
-    Object.entries(expansions).forEach(([abbr, full]) => {
-      const regex = new RegExp(`\\b${abbr}\\b`, 'gi');
-      expanded = expanded.replace(regex, full);
-    });
-    return expanded;
-  };
-
-  const calculateSimilarity = (str1, str2) => {
-    const tokens1 = new Set(normalizeName(str1).split(' '));
-    const tokens2 = new Set(normalizeName(str2).split(' '));
-    const intersection = new Set([...tokens1].filter(x => tokens2.has(x)));
-    const union = new Set([...tokens1, ...tokens2]);
-    return intersection.size / union.size;
-  };
-
-  const identifyAgency = (name, state) => {
-    const normalized = (name || '').toLowerCase();
-    if (normalized.includes('national park') || normalized.includes(' np')) return 'NPS';
-    if (normalized.includes('national forest') || normalized.includes(' nf')) return 'USDA';
-    if (normalized.includes('blm') || normalized.includes('bureau of land')) return 'BLM';
-    if (normalized.includes('state park') || normalized.includes(' sp')) return 'State';
-    if (normalized.includes('county')) return 'County';
-    if (normalized.includes('city') || normalized.includes('municipal')) return 'City';
+  const identifyAgency = (name) => {
+    const n = (name || '').toLowerCase();
+    if (n.includes('national park') || n.includes(' np')) return 'NPS';
+    if (n.includes('national forest') || n.includes(' nf')) return 'USDA';
+    if (n.includes('blm') || n.includes('bureau of land')) return 'BLM';
+    if (n.includes('state park') || n.includes(' sp')) return 'State';
+    if (n.includes('county')) return 'County';
+    if (n.includes('city') || n.includes('municipal')) return 'City';
     return 'Unknown';
   };
 
-  const getSearchDomains = (agency, state) => {
-    const domains = [];
-    switch (agency) {
-      case 'NPS':
-        domains.push('site:nps.gov');
-        break;
-      case 'USDA':
-        domains.push('site:fs.usda.gov', 'site:usda.gov');
-        break;
-      case 'BLM':
-        domains.push('site:blm.gov');
-        break;
-      case 'State':
-        if (state) {
-          domains.push(`site:${state.toLowerCase()}.gov`, `site:stateparks.${state.toLowerCase()}.gov`);
-        }
-        domains.push('site:.gov stateparks');
-        break;
-      case 'County':
-      case 'City':
-        if (state) {
-          domains.push(`site:${state.toLowerCase()}.gov`);
-        }
-        domains.push('site:.gov');
-        break;
-      default:
-        domains.push('site:.gov');
-    }
-    return domains;
-  };
-
   // ---------- REAL WEB LOOKUP (calls your Netlify Function) ----------
-  // Make sure you created netlify/functions/search.js and set BRAVE_API_KEY in Netlify.
-  const verifyFee = async (parkName, state, managingAgency, urlFromRow) => {
-    // Build a matchable name if an AllTrails URL is used
-    let nameForMatch = parkName || '';
+  const verifyFee = async (parkNameOrUrl, state, managingAgency, urlFromRow) => {
+    // Derive a pretty name if an AllTrails URL was provided
+    let nameForMatch = parkNameOrUrl || '';
     try {
-      if (parkName && parkName.includes('alltrails.com')) {
-        const parts = parkName.split('/').filter(Boolean);
+      if (parkNameOrUrl && parkNameOrUrl.includes('alltrails.com')) {
+        const parts = parkNameOrUrl.split('/').filter(Boolean);
         nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
       }
     } catch {}
-    if (!parkName && urlFromRow && urlFromRow.includes('alltrails.com')) {
+    if (!parkNameOrUrl && urlFromRow && urlFromRow.includes('alltrails.com')) {
       const parts = urlFromRow.split('/').filter(Boolean);
       nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
     }
@@ -112,42 +48,54 @@ const ParkFeeVerifier = () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        query: parkName || urlFromRow || '',
+        query: parkNameOrUrl || urlFromRow || '',
         state: (state || '').trim() || null,
         nameForMatch
       })
     });
 
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error('Search function error:', res.status, text);
+      return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
+    }
+
     let data = {};
-    try { data = await res.json(); } catch { data = {}; }
+    try { data = await res.json(); } catch {
+      console.error('Search function JSON parse error');
+      data = {};
+    }
 
     const feeInfo = data.feeInfo || 'Not verified';
-    const kind = data.kind || 'not-verified';
+    const kind = data.kind || 'not-verified';        // expected: "general" | "parking" | "no-fee" | "not-verified"
     const source = data.url || '';
 
-    const baseName = parkName || nameForMatch || 'The park';
+    const baseName = parkNameOrUrl || nameForMatch || 'The park';
 
+    // ---- EXACT alert rules (only 2 templates + lowercase cases) ----
     let alert;
     if (feeInfo === 'No fee') {
       alert = 'no fee';
     } else if (feeInfo === 'Not verified' || !source) {
       alert = 'unverified';
     } else if (kind === 'parking') {
-      alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;\
+      // Parking/lot fee template
+      alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;
     } else {
+      // Generic entrance/day-use fee template
       alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
     }
 
-    // Validation: must end with period & have exactly one URL, except "no fee"/"unverified"
-    const urlCount = (alert.match(/https?:\/\/\S+/g) || []).length;
-    const valid = alert === 'no fee' || alert === 'unverified' || (alert.endsWith('.') && urlCount === 1);
-    if (!valid) alert = 'unverified';
+    // Validation: "no fee"/"unverified" are exact lowercase; others must end with one plain URL and a period
+    if (alert !== 'no fee' && alert !== 'unverified') {
+      const urlCount = (alert.match(/https?:\/\/\S+/g) || []).length;
+      if (!alert.endsWith('.') || urlCount !== 1) {
+        console.warn('Alert formatting adjusted to meet validation rules.');
+        alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
+      }
+    }
 
-    return {
-      feeInfo,
-      feeSource: source,
-      alert
-    };
+    return { feeInfo, feeSource: source, alert };
   };
 
   // ---------- single flow ----------
@@ -158,14 +106,14 @@ const ParkFeeVerifier = () => {
 
     try {
       const isUrl = singleInput.includes('alltrails.com');
-      const parkName = isUrl ? extractParkFromUrl(singleInput) : singleInput;
+      const displayName = isUrl ? extractNameFromAllTrails(singleInput) : singleInput;
 
-      const result = await verifyFee(parkName, null, null, isUrl ? singleInput : null);
+      const result = await verifyFee(singleInput, null, null, isUrl ? singleInput : null);
 
       setResults([{
-        name: parkName,
+        name: displayName,
         state: '',
-        managingAgency: identifyAgency(parkName, null),
+        managingAgency: identifyAgency(displayName),
         ...result
       }]);
 
@@ -177,7 +125,7 @@ const ParkFeeVerifier = () => {
     }
   };
 
-  const extractParkFromUrl = (url) => {
+  const extractNameFromAllTrails = (url) => {
     const match = url.match(/alltrails\.com\/trail\/[^/]+\/([^/?]+)/);
     if (match) {
       return match[1].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
@@ -190,14 +138,12 @@ const ParkFeeVerifier = () => {
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
-      complete: async (results) => {
-        const rows = results.data;
-        setCsvData(rows);
+      complete: async (parsed) => {
+        const rows = parsed.data;
         setProgress({ current: 0, total: rows.length });
         setProcessing(true);
 
         const verifiedResults = [];
-
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
           const parkName = row.name || row.trail_name || row.park || row['Park Name'] || '';
@@ -206,12 +152,12 @@ const ParkFeeVerifier = () => {
           const url = row.url || row.link || '';
 
           if (parkName || url) {
-            const verification = await verifyFee(parkName, state, agency, url);
+            const res = await verifyFee(parkName || url, state, agency, url);
             verifiedResults.push({
               ...row,
-              'Fee Info': verification.feeInfo,
-              'Fee Source': verification.feeSource,
-              'Alert': verification.alert
+              'Fee Info': res.feeInfo,
+              'Fee Source': res.feeSource,
+              'Alert': res.alert
             });
             setProgress({ current: i + 1, total: rows.length });
           }
@@ -220,15 +166,15 @@ const ParkFeeVerifier = () => {
         setResults(verifiedResults);
         setProcessing(false);
       },
-      error: (error) => {
-        console.error('CSV parsing error:', error);
+      error: (err) => {
+        console.error('CSV parsing error:', err);
         setProcessing(false);
       }
     });
   };
 
-  const handleFileUpload = (event) => {
-    const file = event.target.files[0];
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
     if (file) processCSV(file);
   };
 
@@ -294,7 +240,7 @@ const ParkFeeVerifier = () => {
                 onChange={(e) => setSingleInput(e.target.value)}
                 placeholder="Enter park name or AllTrails URL..."
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                onKeyPress={(e) => e.key === 'Enter' && processSingle()}
+                onKeyDown={(e) => e.key === 'Enter' && processSingle()}
               />
               <button
                 onClick={processSingle}
@@ -317,17 +263,10 @@ const ParkFeeVerifier = () => {
                   id="csv-upload"
                   disabled={processing}
                 />
-                <label
-                  htmlFor="csv-upload"
-                  className="cursor-pointer flex flex-col items-center"
-                >
+                <label htmlFor="csv-upload" className="cursor-pointer flex flex-col items-center">
                   <Upload size={48} className="text-gray-400 mb-4" />
-                  <span className="text-lg font-medium text-gray-700">
-                    Upload CSV File
-                  </span>
-                  <span className="text-sm text-gray-500 mt-2">
-                    Processing starts automatically upon upload
-                  </span>
+                  <span className="text-lg font-medium text-gray-700">Upload CSV File</span>
+                  <span className="text-sm text-gray-500 mt-2">Processing starts automatically upon upload</span>
                 </label>
               </div>
 
@@ -360,9 +299,7 @@ const ParkFeeVerifier = () => {
         {results.length > 0 && (
           <div className="bg-white rounded-lg shadow-lg p-6">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-gray-800">
-                Verification Results ({results.length})
-              </h2>
+              <h2 className="text-2xl font-bold text-gray-800">Verification Results ({results.length})</h2>
               <button
                 onClick={downloadResults}
                 className="flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition"
@@ -386,7 +323,8 @@ const ParkFeeVerifier = () => {
                 </thead>
                 <tbody className="divide-y divide-gray-200">
                   {results.slice(0, 25).map((result, idx) => {
-                    const alertDisplay = getAlertDisplay(result.Alert || result.alert);
+                    const alertText = result.Alert || result.alert;
+                    const alertDisplay = getAlertDisplay(alertText);
                     const AlertIcon = alertDisplay.icon;
 
                     return (
@@ -419,7 +357,7 @@ const ParkFeeVerifier = () => {
                           <div className={`flex items-start gap-2 ${alertDisplay.bg} p-2 rounded`}>
                             <AlertIcon size={16} className={`${alertDisplay.color} flex-shrink-0 mt-0.5`} />
                             <span className="text-xs text-gray-800">
-                              {result.Alert || result.alert}
+                              {alertText}
                             </span>
                           </div>
                         </td>
