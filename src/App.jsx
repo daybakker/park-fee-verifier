@@ -10,6 +10,7 @@ const ParkFeeVerifier = () => {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
+  // ---------- helpers ----------
   const normalizeName = (name) => {
     if (!name) return '';
     return name.toLowerCase()
@@ -33,7 +34,6 @@ const ParkFeeVerifier = () => {
       'mt': 'mount',
       'mtn': 'mountain'
     };
-    
     let expanded = name;
     Object.entries(expansions).forEach(([abbr, full]) => {
       const regex = new RegExp(`\\b${abbr}\\b`, 'gi');
@@ -51,7 +51,7 @@ const ParkFeeVerifier = () => {
   };
 
   const identifyAgency = (name, state) => {
-    const normalized = name.toLowerCase();
+    const normalized = (name || '').toLowerCase();
     if (normalized.includes('national park') || normalized.includes(' np')) return 'NPS';
     if (normalized.includes('national forest') || normalized.includes(' nf')) return 'USDA';
     if (normalized.includes('blm') || normalized.includes('bureau of land')) return 'BLM';
@@ -92,74 +92,85 @@ const ParkFeeVerifier = () => {
     return domains;
   };
 
-  const verifyFee = async (parkName, state, managingAgency, url) => {
-    await new Promise(resolve => setTimeout(resolve, 500));
+  // ---------- REAL WEB LOOKUP (calls your Netlify Function) ----------
+  // Make sure you created netlify/functions/search.js and set BRAVE_API_KEY in Netlify.
+  const verifyFee = async (parkName, state, managingAgency, urlFromRow) => {
+    // Build a matchable name if an AllTrails URL is used
+    let nameForMatch = parkName || '';
+    try {
+      if (parkName && parkName.includes('alltrails.com')) {
+        const parts = parkName.split('/').filter(Boolean);
+        nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
+      }
+    } catch {}
+    if (!parkName && urlFromRow && urlFromRow.includes('alltrails.com')) {
+      const parts = urlFromRow.split('/').filter(Boolean);
+      nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
+    }
 
-    const normalized = normalizeName(parkName);
-    const expanded = expandAbbreviations(parkName);
-    const agency = managingAgency || identifyAgency(parkName, state);
-    
-    const random = Math.random();
-    
-    if (normalized.includes('free') || normalized.includes('open space')) {
-      return {
-        feeInfo: 'No fee',
-        feeSource: 'https://example.gov/parks/free-access',
-        alert: 'no fee'
-      };
+    const res = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: parkName || urlFromRow || '',
+        state: (state || '').trim() || null,
+        nameForMatch
+      })
+    });
+
+    let data = {};
+    try { data = await res.json(); } catch { data = {}; }
+
+    const feeInfo = data.feeInfo || 'Not verified';
+    const kind = data.kind || 'not-verified';
+    const source = data.url || '';
+
+    const baseName = parkName || nameForMatch || 'The park';
+
+    let alert;
+    if (feeInfo === 'No fee') {
+      alert = 'no fee';
+    } else if (feeInfo === 'Not verified' || !source) {
+      alert = 'unverified';
+    } else if (kind === 'parking') {
+      alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;
+    } else if (kind === 'vehicle') {
+      alert = `${baseName} charges a fee to enter. The fee varies depending on the vehicle used to enter the park (car, motorcycle, bike, on foot, or on horseback). For more information, please visit ${source}.`;
+    } else {
+      alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
     }
-    
-    if (random < 0.3) {
-      return {
-        feeInfo: 'Not verified',
-        feeSource: '',
-        alert: 'unverified'
-      };
-    }
-    
-    if (random < 0.6) {
-      const fee = Math.floor(Math.random() * 30) + 5;
-      return {
-        feeInfo: `$${fee} per vehicle`,
-        feeSource: `https://example.gov/parks/${normalized.replace(/\s+/g, '-')}`,
-        alert: `${parkName} charges a fee to enter. For more information, please visit https://example.gov/parks/${normalized.replace(/\s+/g, '-')}.`
-      };
-    }
-    
-    if (random < 0.8) {
-      return {
-        feeInfo: 'Vehicle-dependent fee',
-        feeSource: `https://example.gov/parks/${normalized.replace(/\s+/g, '-')}/fees`,
-        alert: `${parkName} charges a fee to enter. The fee varies depending on the vehicle used to enter the park (car, motorcycle, bike, on foot, or on horseback). For more information, please visit https://example.gov/parks/${normalized.replace(/\s+/g, '-')}/fees.`
-      };
-    }
-    
+
+    // Validation: must end with period & have exactly one URL, except "no fee"/"unverified"
+    const urlCount = (alert.match(/https?:\/\/\S+/g) || []).length;
+    const valid = alert === 'no fee' || alert === 'unverified' || (alert.endsWith('.') && urlCount === 1);
+    if (!valid) alert = 'unverified';
+
     return {
-      feeInfo: '$10 parking fee',
-      feeSource: `https://example.gov/parks/${normalized.replace(/\s+/g, '-')}/parking`,
-      alert: `There is a fee to park at ${parkName} parking area. For more information, please visit https://example.gov/parks/${normalized.replace(/\s+/g, '-')}/parking.`
+      feeInfo,
+      feeSource: source,
+      alert
     };
   };
 
+  // ---------- single flow ----------
   const processSingle = async () => {
     if (!singleInput.trim()) return;
-    
     setProcessing(true);
     setProgress({ current: 0, total: 1 });
-    
+
     try {
       const isUrl = singleInput.includes('alltrails.com');
       const parkName = isUrl ? extractParkFromUrl(singleInput) : singleInput;
-      
+
       const result = await verifyFee(parkName, null, null, isUrl ? singleInput : null);
-      
+
       setResults([{
         name: parkName,
         state: '',
         managingAgency: identifyAgency(parkName, null),
         ...result
       }]);
-      
+
       setProgress({ current: 1, total: 1 });
     } catch (error) {
       console.error('Error processing:', error);
@@ -176,6 +187,7 @@ const ParkFeeVerifier = () => {
     return url;
   };
 
+  // ---------- CSV flow (auto-run on upload) ----------
   const processCSV = async (file) => {
     Papa.parse(file, {
       header: true,
@@ -185,17 +197,17 @@ const ParkFeeVerifier = () => {
         setCsvData(rows);
         setProgress({ current: 0, total: rows.length });
         setProcessing(true);
-        
+
         const verifiedResults = [];
-        
+
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
           const parkName = row.name || row.trail_name || row.park || row['Park Name'] || '';
           const state = row.state || row.State || '';
           const agency = row.agency || row.managing_agency || '';
           const url = row.url || row.link || '';
-          
-          if (parkName) {
+
+          if (parkName || url) {
             const verification = await verifyFee(parkName, state, agency, url);
             verifiedResults.push({
               ...row,
@@ -206,7 +218,7 @@ const ParkFeeVerifier = () => {
             setProgress({ current: i + 1, total: rows.length });
           }
         }
-        
+
         setResults(verifiedResults);
         setProcessing(false);
       },
@@ -219,9 +231,7 @@ const ParkFeeVerifier = () => {
 
   const handleFileUpload = (event) => {
     const file = event.target.files[0];
-    if (file) {
-      processCSV(file);
-    }
+    if (file) processCSV(file);
   };
 
   const downloadResults = () => {
@@ -245,13 +255,14 @@ const ParkFeeVerifier = () => {
     return { icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
   };
 
+  // ---------- UI ----------
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 p-6">
       <div className="max-w-7xl mx-auto">
         <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
           <h1 className="text-3xl font-bold text-gray-800 mb-2">Park & Trail Fee Verifier</h1>
           <p className="text-gray-600 mb-6">Verify entrance, parking, and permit fees using official sources</p>
-          
+
           <div className="flex gap-4 mb-6">
             <button
               onClick={() => setInputMode('single')}
@@ -321,7 +332,7 @@ const ParkFeeVerifier = () => {
                   </span>
                 </label>
               </div>
-              
+
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                 <h3 className="font-semibold text-blue-900 mb-2">Expected CSV Columns:</h3>
                 <p className="text-sm text-blue-800">
@@ -379,7 +390,7 @@ const ParkFeeVerifier = () => {
                   {results.slice(0, 25).map((result, idx) => {
                     const alertDisplay = getAlertDisplay(result.Alert || result.alert);
                     const AlertIcon = alertDisplay.icon;
-                    
+
                     return (
                       <tr key={idx} className="hover:bg-gray-50">
                         <td className="px-4 py-3 text-sm text-gray-900">
