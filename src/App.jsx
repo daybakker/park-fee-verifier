@@ -1,67 +1,106 @@
-// src/App.jsx
 import React, { useState } from 'react';
 import { Upload, Download, Search, AlertCircle, CheckCircle, XCircle } from 'lucide-react';
 import Papa from 'papaparse';
 
-/* ------------------------------- Helpers ------------------------------- */
+/* ----------------------------- Normalization ---------------------------- */
 
-// Little badge styling helper for the Alert column
+const toNorm = (s) => (s || '')
+  .toLowerCase()
+  .replace(/[\u2019']/g, '')        // apostrophes
+  .replace(/[^\p{L}\p{N}\s]/gu, '') // punctuation
+  .replace(/\s+/g, ' ')
+  .trim();
+
+// Expand common abbreviations so “SP”, “NP”, etc. group together
+const expand = (s) => {
+  const m = toNorm(s);
+  return m
+    .replace(/\bsp\b/g, 'state park')
+    .replace(/\bnp\b/g, 'national park')
+    .replace(/\bsna\b/g, 'state natural area')
+    .replace(/\bnhp\b/g, 'national historical park')
+    .replace(/\bnf\b/g, 'national forest')
+    .replace(/\bnra\b/g, 'national recreation area')
+    .replace(/\bnwr\b/g, 'national wildlife refuge')
+    .replace(/\bshp\b/g, 'state historic park');
+};
+
+// Make a deterministic group key for “same park”
+const parkKey = (name) => expand(name);
+
+/* --------------------------------- UI ---------------------------------- */
+
 const getAlertDisplay = (alert) => {
-  if (alert === 'no fee') {
-    return { icon: CheckCircle, color: 'text-green-600', bg: 'bg-green-50' };
-  }
-  if (alert === 'unverified') {
-    return { icon: XCircle, color: 'text-gray-600', bg: 'bg-gray-50' };
-  }
+  if (alert === 'no fee') return { icon: CheckCircle, color: 'text-green-600', bg: 'bg-green-50' };
+  if (alert === 'unverified') return { icon: XCircle, color: 'text-gray-600', bg: 'bg-gray-50' };
   return { icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
 };
 
-// Stable cache key so duplicates get identical answers
-const buildKey = (name, state, agency) =>
-  [ (name||'').toLowerCase().trim(), (state||'').toLowerCase().trim(), (agency||'').toLowerCase().trim() ]
-    .join('|');
-
-// Convert API result -> our row fields (Fee Info, Fee Source, Alert)
-function toRowAugment(parkDisplay, apiResult) {
-  const url = apiResult?.url || '';
-  const info = apiResult?.feeInfo || 'Not verified';
-  let alert = 'unverified';
-
-  if ((apiResult?.kind || '') === 'no-fee') {
-    alert = 'no fee';
-  } else if (apiResult?.kind === 'general' && url) {
-    alert = `${parkDisplay} charges a fee to enter. For more information, please visit ${url}.`;
-  }
-
-  return { info, url, alert };
-}
-
-// One lookup with automatic retry (strict -> lenient)
-async function lookupWithRetry({ query, state, nameForMatch }) {
-  const strict = await fetch('/api/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, state, nameForMatch })
-  }).then(r => r.json()).catch(() => ({ url: null, feeInfo: 'Not verified', kind: 'not-verified' }));
-
-  if (strict && strict.kind !== 'not-verified') return strict;
-
-  const lenient = await fetch('/api/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, state, nameForMatch, lenient: true })
-  }).then(r => r.json()).catch(() => ({ url: null, feeInfo: 'Not verified', kind: 'not-verified' }));
-
-  return lenient;
-}
-
-// Detect if user typed an AllTrails URL (single-search convenience)
 const isAllTrailsUrl = (s) => {
   try { return new URL(s).hostname.includes('alltrails.com'); }
   catch { return false; }
 };
 
-/* --------------------------------- UI --------------------------------- */
+// Turn the API payload into our three columns
+function toAugment(parkDisplay, api) {
+  const url = api?.url || api?.homepage || '';           // prefer direct fee URL, else homepage if provided
+  const kind = api?.kind || 'not-verified';
+  const feeInfo = api?.feeInfo || (kind === 'no-fee' ? 'No fee' : 'Not verified');
+
+  let alert = 'unverified';
+  if (kind === 'no-fee') {
+    alert = 'no fee';
+  } else if (kind === 'general' || kind === 'parking') {
+    // Only two alert templates you asked to keep
+    if (kind === 'parking') {
+      // trailhead/lot case
+      alert = `There is a fee to park at ${parkDisplay}. For more information, please visit ${url}.`;
+    } else {
+      // general “entrance fee”
+      alert = `${parkDisplay} charges a fee to enter. For more information, please visit ${url}.`;
+    }
+  }
+  return { feeInfo, feeSource: url, alert, kind };
+}
+
+/* --------------------------- Backend Lookups --------------------------- */
+
+async function callSearch({ query, state, nameForMatch, lenient }) {
+  try {
+    const res = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        state,
+        nameForMatch,
+        lenient: !!lenient,
+        wantHomepage: true // optional convenience for “always include a source”
+      })
+    });
+    return await res.json();
+  } catch {
+    return { url: null, feeInfo: 'Not verified', kind: 'not-verified' };
+  }
+}
+
+// One grouped lookup with strict->lenient retries
+async function lookupGroup({ query, state, nameForMatch }) {
+  // strict pass
+  const strict = await callSearch({ query, state, nameForMatch, lenient: false });
+  if (strict && strict.kind !== 'not-verified') return strict;
+
+  // lenient pass, broaden keywords (.gov/.org + admission/fees/day-use, etc.)
+  // NOTE: we widen in the *backend*, but as an extra hint we can also append keywords here.
+  const fallbackQuery = isAllTrailsUrl(query)
+    ? query
+    : `${query} (admission OR fees OR "day-use" OR parking)`;
+
+  const lenient = await callSearch({ query: fallbackQuery, state, nameForMatch, lenient: true });
+  return lenient || { url: null, feeInfo: 'Not verified', kind: 'not-verified' };
+}
+
+/* --------------------------------- App --------------------------------- */
 
 const App = () => {
   const [inputMode, setInputMode] = useState('single');
@@ -70,113 +109,151 @@ const App = () => {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
-  /* --------------------------- Single Search --------------------------- */
+  /* ------------------------------- Single ------------------------------- */
   const processSingle = async () => {
-    const value = (singleInput || '').trim();
-    if (!value) return;
+    const raw = (singleInput || '').trim();
+    if (!raw) return;
 
     setProcessing(true);
     setProgress({ current: 0, total: 1 });
 
     try {
-      // If user pasted an AllTrails URL, just use it as query
-      const query = value;
-      const apiRes = await lookupWithRetry({ query, state: undefined, nameForMatch: isAllTrailsUrl(value) ? undefined : value });
+      const query = raw; // name or AllTrails URL
+      const nameForMatch = isAllTrailsUrl(raw) ? undefined : raw;
 
-      const parkDisplay = value; // for alert text
-      const augment = toRowAugment(parkDisplay, apiRes);
+      const api = await lookupGroup({ query, state: undefined, nameForMatch });
+      const augment = toAugment(raw, api);
 
       setResults([{
-        name: value,
+        name: raw,
         state: '-',
-        agency: isAllTrailsUrl(value) ? 'Unknown' : 'State',
-        'Fee Info': augment.info,
-        'Fee Source': augment.url,
+        agency: '-',
+        'Fee Info': augment.feeInfo,
+        'Fee Source': augment.feeSource,
         'Alert': augment.alert
       }]);
 
       setProgress({ current: 1, total: 1 });
-    } catch (e) {
-      console.error(e);
     } finally {
       setProcessing(false);
     }
   };
 
-  /* ----------------------------- CSV Upload ---------------------------- */
+  /* -------------------------------- Batch ------------------------------- */
+
+  // Build a minimal “group model” so a group gets exactly one lookup + a lenient retry
+  function groupRows(rows) {
+    const groups = new Map(); // key -> { displayName, rowsIdx:[], state?, firstQuery }
+    rows.forEach((row, idx) => {
+      const name = row.name || row.trail_name || row.park || row['Park Name'] || row.Park || '';
+      const url = row.url || row.link || '';
+      const display = name || url || `Row ${idx+1}`;
+      const key = parkKey(name || url);
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          displayName: display,
+          state: row.state || row.State || undefined,
+          query: url ? url : name,  // prefer URL if present (AllTrails)
+          rowsIdx: []
+        });
+      }
+      groups.get(key).rowsIdx.push(idx);
+    });
+    return groups;
+  }
+
   const processCSV = async (file) => {
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
       complete: async (parsed) => {
         const rows = parsed.data || [];
-        setProgress({ current: 0, total: rows.length });
+        if (rows.length === 0) { setResults([]); return; }
+
         setProcessing(true);
+        setProgress({ current: 0, total: rows.length });
 
-        // Cache to make duplicate parks consistent
-        const verCache = new Map();
+        // 1) Build groups so each park gets a single canonical lookup
+        const groups = groupRows(rows);
 
-        // Limit concurrency to keep API happy
-        const CONCURRENCY = 3;
-        let index = 0;
-        const out = new Array(rows.length);
+        // 2) Resolve each group (strict->lenient), cache per group
+        const groupResults = new Map(); // key -> {feeInfo, feeSource, alert, kind}
 
-        const runOne = async (i) => {
-          const row = rows[i];
-          const nameRaw = row.name || row.trail_name || row.park || row['Park Name'] || '';
-          const stateRaw = row.state || row.State || '';
-          const agencyRaw = row.agency || row.managing_agency || '';
-          const urlRaw = row.url || row.link || '';
+        // Small worker pool to control concurrency
+        const keys = Array.from(groups.keys());
+        let ptr = 0;
+        const CONCURRENCY = 4;
 
-          if (!nameRaw && !urlRaw) {
-            out[i] = { ...row, 'Fee Info': 'Not verified', 'Fee Source': '', 'Alert': 'unverified' };
-            setProgress(p => ({ current: p.current + 1, total: p.total }));
-            return;
-          }
+        const runWorker = async () => {
+          while (true) {
+            const i = ptr++; if (i >= keys.length) break;
+            const g = groups.get(keys[i]);
 
-          const isAllTrails = urlRaw && urlRaw.includes('alltrails.com');
-          const query = isAllTrails ? urlRaw : nameRaw;
-
-          const key = buildKey(nameRaw, stateRaw, agencyRaw);
-          let cached = verCache.get(key);
-
-          if (!cached) {
-            const apiRes = await lookupWithRetry({
-              query,
-              state: stateRaw || undefined,
-              nameForMatch: isAllTrails ? undefined : nameRaw
+            // One lookup per group
+            const api = await lookupGroup({
+              query: g.query,
+              state: g.state,
+              nameForMatch: isAllTrailsUrl(g.query) ? undefined : g.displayName
             });
 
-            const parkDisplay = nameRaw || apiRes?.displayName || 'This park';
-            const augment = toRowAugment(parkDisplay, apiRes);
-
-            cached = {
-              feeInfo: augment.info,
-              feeSource: augment.url,
-              alert: augment.alert
-            };
-            verCache.set(key, cached);
+            groupResults.set(g.key, toAugment(g.displayName, api));
           }
-
-          out[i] = {
-            ...row,
-            'Fee Info': cached.feeInfo,
-            'Fee Source': cached.feeSource,
-            'Alert': cached.alert
-          };
-
-          setProgress(p => ({ current: p.current + 1, total: p.total }));
         };
+        await Promise.all(new Array(Math.min(CONCURRENCY, keys.length)).fill(0).map(runWorker));
 
-        // Small worker pool
-        const workers = new Array(Math.min(CONCURRENCY, rows.length)).fill(0).map(async () => {
-          while (true) {
-            const i = index++;
-            if (i >= rows.length) break;
-            await runOne(i);
-          }
+        // 3) First fill using group results
+        const out = rows.map((row, idx) => {
+          const name = row.name || row.trail_name || row.park || row['Park Name'] || row.Park || '';
+          const url = row.url || row.link || '';
+          const display = name || url || `Row ${idx+1}`;
+          const key = parkKey(name || url);
+          const g = groupResults.get(key);
+
+          const feeInfo = g?.feeInfo || 'Not verified';
+          const feeSource = g?.feeSource || '';
+          const alert = g?.alert || 'unverified';
+
+          // progress tick
+          setProgress(p => ({ current: Math.min(p.current + 1, p.total), total: p.total }));
+
+          return {
+            ...row,
+            'Fee Info': feeInfo,
+            'Fee Source': feeSource,
+            'Alert': alert
+          };
         });
-        await Promise.all(workers);
+
+        // 4) Group backfill: if any row in a group is verified, copy to all rows in the same group
+        //    This removes the “one unverified among identical names” problem.
+        for (const [key, group] of groups.entries()) {
+          const idxs = group.rowsIdx;
+          const best = idxs
+            .map(i => out[i])
+            .map(r => ({
+              i: r,
+              score:
+                (r['Alert'] === 'no fee' ? 3 :
+                (r['Alert'] && r['Alert'] !== 'unverified' ? 2 :
+                (r['Fee Source'] ? 1 : 0))) // prefer verified w/fee, then no-fee, then homepage, then none
+            }))
+            .sort((a,b) => b.score - a.score)[0];
+
+          if (best && best.score > 1) { // has a verified fee alert (2 or 3)
+            idxs.forEach(i => {
+              out[i]['Fee Info'] = best.i['Fee Info'];
+              out[i]['Fee Source'] = best.i['Fee Source'];
+              out[i]['Alert'] = best.i['Alert'];
+            });
+          } else if (best && best.score === 1) {
+            // we have at least a homepage source — keep consistency
+            idxs.forEach(i => {
+              if (!out[i]['Fee Source']) out[i]['Fee Source'] = best.i['Fee Source'];
+            });
+          }
+        }
 
         setResults(out);
         setProcessing(false);
@@ -190,18 +267,21 @@ const App = () => {
 
   const handleFileUpload = (e) => {
     const file = e.target.files?.[0];
-    if (file) processCSV(file);
+    if (file) {
+      setInputMode('batch');
+      processCSV(file);
+    }
   };
 
   const downloadResults = () => {
     const csv = Papa.unparse(results);
     const blob = new Blob([csv], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `verified_fees_${Date.now()}.csv`;
     a.click();
-    window.URL.revokeObjectURL(url);
+    URL.revokeObjectURL(url);
   };
 
   /* -------------------------------- Render ------------------------------- */
@@ -227,20 +307,19 @@ const App = () => {
             <label className={`flex-1 py-3 px-4 rounded-lg font-medium transition text-center cursor-pointer ${
               inputMode === 'batch' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
             }`}>
-              <input type="file" accept=".csv" className="hidden" onChange={(e) => { setInputMode('batch'); handleFileUpload(e); }} />
+              <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
               <Upload className="inline mr-2" size={20} />
               CSV Batch Upload
             </label>
           </div>
 
-          {/* Single input */}
           {inputMode === 'single' && (
             <div className="space-y-4">
               <input
                 type="text"
                 value={singleInput}
                 onChange={(e) => setSingleInput(e.target.value)}
-                placeholder="Enter park name OR paste an AllTrails trail URL…"
+                placeholder="Enter park name or paste an AllTrails trail URL…"
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 onKeyDown={(e) => e.key === 'Enter' && processSingle()}
               />
@@ -254,7 +333,6 @@ const App = () => {
             </div>
           )}
 
-          {/* Progress bar */}
           {processing && (
             <div className="mt-6">
               <div className="flex justify-between text-sm text-gray-600 mb-2">
@@ -271,7 +349,6 @@ const App = () => {
           )}
         </div>
 
-        {/* Results */}
         {results.length > 0 && (
           <div className="bg-white rounded-lg shadow-lg p-6">
             <div className="flex justify-between items-center mb-6">
@@ -300,27 +377,19 @@ const App = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200">
-                  {results.slice(0, 1000).map((r, idx) => {
-                    const alertText = r.Alert || r.alert || 'unverified';
+                  {results.slice(0, 1500).map((r, idx) => {
+                    const alertText = r.Alert || 'unverified';
                     const { icon: Icon, color, bg } = getAlertDisplay(alertText);
-                    const feeInfo = r['Fee Info'] || r.feeInfo || 'Not verified';
-                    const feeSource = r['Fee Source'] || r.feeSource || '';
                     const displayName = r.name || r.trail_name || r.park || r['Park Name'] || r.Park || '-';
-
                     return (
                       <tr key={idx} className="hover:bg-gray-50">
                         <td className="px-4 py-3 text-sm text-gray-900">{displayName}</td>
                         <td className="px-4 py-3 text-sm text-gray-600">{r.state || r.State || '-'}</td>
                         <td className="px-4 py-3 text-sm text-gray-600">{r.agency || r.managing_agency || '-'}</td>
-                        <td className="px-4 py-3 text-sm text-gray-900 font-medium">{feeInfo}</td>
+                        <td className="px-4 py-3 text-sm text-gray-900 font-medium">{r['Fee Info'] || 'Not verified'}</td>
                         <td className="px-4 py-3 text-sm">
-                          {feeSource ? (
-                            <a
-                              href={feeSource}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-blue-600 hover:underline"
-                            >
+                          {r['Fee Source'] ? (
+                            <a href={r['Fee Source']} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
                               View Source
                             </a>
                           ) : null}
@@ -338,9 +407,9 @@ const App = () => {
               </table>
             </div>
 
-            {results.length > 1000 && (
+            {results.length > 1500 && (
               <p className="text-sm text-gray-600 mt-4 text-center">
-                Showing first 1000 results. Download CSV for the complete data.
+                Showing first 1500 results. Download CSV for the complete data.
               </p>
             )}
           </div>
