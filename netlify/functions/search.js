@@ -1,9 +1,9 @@
 // Netlify Function: /api/search
-// v21 — International wide-search + debug: returns topUrls when not verified
-// Needs Netlify env: BRAVE_API_KEY
+// v23 — International search + AllTrails URL extractor + region strictness + anti-wrong-state
+// Env required: BRAVE_API_KEY
 
 /////////////////////////////
-// Multilingual signals
+// Multilingual fee signals
 /////////////////////////////
 const ENTRANCE_TERMS = [
   "entrance","entry","admission","day-use","day use","access",
@@ -11,28 +11,21 @@ const ENTRANCE_TERMS = [
   "entrée","entree","accès","acces",
   "eintritt","zugang",
   "ingresso","accesso","biglietto",
-  "entrada","acesso", // PT
+  "entrada","acesso",
   "toegang","adgang","inträde","inngang",
   "giriş","girış",
   "入場","入園","料金",
   "门票","門票","票價","票价","收费","收費",
-  "입장료","요금"
+  "入場料","입장료","요금"
 ];
 
 const FEE_TERMS = [
-  // EN
-  "fee","fees","price","prices","rate","rates","pricing","pass","day-use","parking fee",
-  // ES
+  "fee","fees","price","prices","rate","rates","pricing","pass","parking fee","day-use",
   "tarifa","tarifas","precio","precios","pase",
-  // FR
   "tarif","tarifs","prix","pass",
-  // DE
   "gebühr","gebuehr","gebühren","preise",
-  // IT
   "tariffa","tariffe","prezzo","prezzi","pass",
-  // PT
   "taxa","taxas","preço","preços","passe",
-  // Others
   "料金","요금","收费","收費","цена","цены"
 ];
 
@@ -45,11 +38,55 @@ const NO_FEE_TERMS = [
   "免费","免費","無料","무료"
 ];
 
-// Currency patterns (many)
+// Currency recognition (broad)
 const CURRENCY_RX = /(\$|€|£|¥|₹|₩|₺|₽|₴|R\$|C\$|A\$|NZ\$|CHF|SEK|NOK|DKK|zł|Kč|Ft|₫|R|AED|SAR|₱|MXN|COP|PEN|S\/|CLP|ARS)\s?\d{1,3}(?:[.,]\d{2})?/i;
 
 /////////////////////////////
-// Helpers
+// Region knowledge (light)
+/////////////////////////////
+const US_STATES = [
+  ["AL","Alabama"],["AK","Alaska"],["AZ","Arizona"],["AR","Arkansas"],["CA","California"],
+  ["CO","Colorado"],["CT","Connecticut"],["DE","Delaware"],["FL","Florida"],["GA","Georgia"],
+  ["HI","Hawaii"],["ID","Idaho"],["IL","Illinois"],["IN","Indiana"],["IA","Iowa"],
+  ["KS","Kansas"],["KY","Kentucky"],["LA","Louisiana"],["ME","Maine"],["MD","Maryland"],
+  ["MA","Massachusetts"],["MI","Michigan"],["MN","Minnesota"],["MS","Mississippi"],["MO","Missouri"],
+  ["MT","Montana"],["NE","Nebraska"],["NV","Nevada"],["NH","New Hampshire"],["NJ","New Jersey"],
+  ["NM","New Mexico"],["NY","New York"],["NC","North Carolina"],["ND","North Dakota"],["OH","Ohio"],
+  ["OK","Oklahoma"],["OR","Oregon"],["PA","Pennsylvania"],["RI","Rhode Island"],["SC","South Carolina"],
+  ["SD","South Dakota"],["TN","Tennessee"],["TX","Texas"],["UT","Utah"],["VT","Vermont"],
+  ["VA","Virginia"],["WA","Washington"],["WV","West Virginia"],["WI","Wisconsin"],["WY","Wyoming"],
+  ["DC","District of Columbia"]
+];
+
+const US_STATE_NAME_TO_ABBR = Object.fromEntries(US_STATES.map(([a,n]) => [n.toLowerCase(), a]));
+const US_ABBR_TO_NAME = Object.fromEntries(US_STATES.map(([a,n]) => [a.toLowerCase(), n]));
+
+function normalizeStateTerms(input) {
+  if (!input) return [];
+  const s = input.trim().toLowerCase();
+  // accept "tx" / "texas" etc.
+  for (const [abbr, name] of US_STATES) {
+    if (s === abbr.toLowerCase() || s === name.toLowerCase()) {
+      return [abbr.toLowerCase(), name.toLowerCase()];
+    }
+  }
+  // otherwise treat the token as a free region token
+  return [s];
+}
+
+function otherUsStateTokens(excludeTokens) {
+  const ex = new Set(excludeTokens.map(t => t.toLowerCase()));
+  const tokens = [];
+  for (const [abbr, name] of US_STATES) {
+    if (!ex.has(abbr.toLowerCase()) && !ex.has(name.toLowerCase())) {
+      tokens.push(abbr.toLowerCase(), name.toLowerCase());
+    }
+  }
+  return tokens;
+}
+
+/////////////////////////////
+// General helpers
 /////////////////////////////
 function toSlug(s = "") {
   return s
@@ -71,8 +108,7 @@ async function fetchText(url) {
   try {
     const r = await fetch(url, { redirect: "follow" });
     if (!r.ok) return "";
-    // cap to keep memory safe
-    return (await r.text()).slice(0, 900000);
+    return (await r.text()).slice(0, 900000); // cap
   } catch { return ""; }
 }
 
@@ -126,7 +162,7 @@ function isSameNpsUnit(r, displayName) {
 }
 
 // Global “official-ish” scoring
-function scoreHost(url, displayName = "", query = "", npsIntent = false) {
+function scoreHost(url, displayName = "", query = "", npsIntent = false, regionTokens = [], otherStateTokens = []) {
   let score = 0;
   let host = "", path = "";
   try {
@@ -135,6 +171,7 @@ function scoreHost(url, displayName = "", query = "", npsIntent = false) {
     path = u.pathname.toLowerCase();
   } catch { return -1; }
 
+  // government-ish
   const isGov =
     /\.gov(\.[a-z]{2})?$/.test(host) ||
     /\.govt\.[a-z]{2}$/.test(host) ||
@@ -146,15 +183,30 @@ function scoreHost(url, displayName = "", query = "", npsIntent = false) {
 
   if (isGov) score += 80;
 
+  // US federal agencies
   if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 80 : 10);
   if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
 
+  // park-ish org/com
   const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|natur|nature|reserva|reserve|parc|parque|parchi|gemeente|municipality|municipio|ayuntamiento|city|county|regionalpark|provincialpark)/.test(host);
   if (parkish) score += 28;
 
+  // fee-y paths
   if (looksLikeFeePath(path)) score += 30;
 
+  // region tokens boost
+  const joined = host + " " + path;
+  for (const t of regionTokens) {
+    if (t && joined.includes(t)) score += 20;
+  }
+
+  // penalize other US states appearing in host/path (wrong-state guard)
+  for (const t of otherStateTokens) {
+    if (t && joined.includes(t)) score -= 30;
+  }
+
+  // similarity to name/query
   const sim = Math.max(
     tokenSim(displayName, host),
     tokenSim(displayName, path),
@@ -162,13 +214,7 @@ function scoreHost(url, displayName = "", query = "", npsIntent = false) {
   );
   score += Math.round(sim * 30);
 
-  const qLower = (query || "").toLowerCase();
-  const looksStateOrRegional = /state park|provincial park|regional park|city park|county park|parque estatal|provincial|regional/.test(qLower);
-  if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) {
-    score -= 40;
-    if (looksStateOrRegional) score -= 60;
-  }
-
+  // slug hint
   const slug = toSlug(displayName || query);
   if (slug && path.includes(slug)) score += 25;
 
@@ -180,7 +226,88 @@ function ok(payload) {
 }
 
 /////////////////////////////
-// Main
+// AllTrails helpers
+/////////////////////////////
+function isAllTrailsUrl(s) {
+  try { return new URL(s).hostname.includes("alltrails.com"); } catch { return false; }
+}
+
+// Try to infer state from an AllTrails trail URL like /trail/us/virginia/old-rag-...
+function guessStateFromAllTrailsUrl(u) {
+  try {
+    const url = new URL(u);
+    const parts = url.pathname.split("/").filter(Boolean);
+    // e.g., ["trail","us","virginia","old-rag..."]
+    if (parts[0] === "trail" && parts[1] === "us" && parts[2]) {
+      const stateName = parts[2].replace(/-/g, " ").toLowerCase();
+      // Map to abbr if we can
+      const abbr = US_STATE_NAME_TO_ABBR[stateName];
+      if (abbr) return US_STATES.find(([a]) => a === abbr)[1]; // Proper case
+      // Try capitalizing each word
+      return stateName.replace(/\b\w/g, c => c.toUpperCase());
+    }
+    return null;
+  } catch { return null; }
+}
+
+// Heuristics to extract managing park from AllTrails HTML
+async function extractParkFromAllTrails(url) {
+  const html = await fetchText(url);
+  if (!html) return { parkName: null, region: null };
+
+  // Look for "park" page links in breadcrumbs or tag sections
+  // Example anchor: <a href="https://www.alltrails.com/park/us/virginia/shenandoah-national-park">Shenandoah National Park</a>
+  const parkLinkRegex = /<a[^>]+href="https?:\/\/www\.alltrails\.com\/park\/[^"]+"[^>]*>([^<]{3,120})<\/a>/gi;
+  let m, candidates = [];
+  while ((m = parkLinkRegex.exec(html)) !== null) {
+    const name = (m[1] || "").replace(/\s+/g, " ").trim();
+    if (name && !/alltrails/i.test(name)) candidates.push(name);
+  }
+
+  // Try JSON-LD (some pages have structured data with "name")
+  // We scan for the biggest JSON-LD and look for "park" / "area" text nearby
+  if (candidates.length === 0) {
+    const ldjsonRegex = /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+    let bestLen = 0, bestBlock = "";
+    let mm;
+    while ((mm = ldjsonRegex.exec(html)) !== null) {
+      if (mm[1] && mm[1].length > bestLen) {
+        bestLen = mm[1].length; bestBlock = mm[1];
+      }
+    }
+    if (bestBlock) {
+      try {
+        const data = JSON.parse(bestBlock);
+        const names = [];
+        const crawl = (obj) => {
+          if (!obj) return;
+          if (Array.isArray(obj)) return obj.forEach(crawl);
+          if (typeof obj === "object") {
+            if (typeof obj.name === "string") names.push(obj.name);
+            Object.values(obj).forEach(crawl);
+          }
+        };
+        crawl(data);
+        for (const n of names) {
+          if (/park|parc|parque|reserve|preserve|forest|national/i.test(n)) {
+            candidates.push(n);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // Unique + pick the most "park-ish"
+  candidates = [...new Set(candidates)];
+  candidates.sort((a,b) => (/\b(national|state|provincial|regional)\b/i.test(b)?1:0) - (/\b(national|state|provincial|regional)\b/i.test(a)?1:0));
+
+  const parkName = candidates[0] || null;
+  const region = guessStateFromAllTrailsUrl(url);
+  return { parkName, region };
+}
+
+/////////////////////////////
+// Main search handler
 /////////////////////////////
 export async function handler(event) {
   if (event.httpMethod !== "POST") return ok({ error: "POST only" });
@@ -190,39 +317,63 @@ export async function handler(event) {
 
   let body = {};
   try { body = JSON.parse(event.body || "{}"); } catch {}
-  const { query, state = null, nameForMatch = null } = body;
+  let { query, state = null, nameForMatch = null } = body;
   if (!query) return ok({ error: "Missing query" });
 
-  const displayName = nameForMatch || query;
-  const npsIntent = detectNpsIntent(query);
+  // AllTrails: if query is an AllTrails URL, resolve to park name + region
+  if (isAllTrailsUrl(query)) {
+    const { parkName, region } = await extractParkFromAllTrails(query);
+    if (parkName) {
+      nameForMatch = parkName;
+    }
+    if (region && !state) {
+      state = region; // e.g., "Texas"
+    }
+    // If we still don't have a name, fall back to any slug words to improve results
+    if (!nameForMatch) {
+      try {
+        const u = new URL(query);
+        const parts = u.pathname.split("/").filter(Boolean);
+        // keep last segment words as hint
+        nameForMatch = parts[parts.length - 1]?.replace(/-/g, " ");
+      } catch {}
+    }
+  }
 
-  // VERY BROAD query set (scoped and unscoped)
-  const baseTerms = `(admission OR "entrance fee" OR "day use" OR day-use OR fee OR fees OR prices OR rates OR pricing OR tarifa OR tarifs OR preise OR prezzi OR precios OR 料金 OR 요금 OR 收费 OR "$")`;
-  const queries = [
-    `${query} ${baseTerms}`,                 // unscoped wide
-    `"${query}" ${baseTerms}`,              // exact name + wide
-    `${query} (site:.gov OR site:.gov.* OR site:.govt.* OR site:.gouv.* OR site:.go.* OR site:.gob.*) ${baseTerms}`, // global gov-ish
-    `${query} (site:.org OR site:.com) (park OR parks OR "national park" OR "state park" OR parc OR parque OR reserve) ${baseTerms}` // park org/com
+  const displayName = nameForMatch || query;
+  const npsIntent = detectNpsIntent(displayName);
+
+  // Region tokens & wrong-state penalties
+  const regionTokens = normalizeStateTerms(state); // e.g., ["tx","texas"]
+  const otherStateTokens = regionTokens.length ? otherUsStateTokens(regionTokens) : [];
+
+  // VERY BROAD queries with exact phrase variants
+  const core = `(admission OR "entrance fee" OR "day use" OR day-use OR fee OR fees OR prices OR rates OR pricing OR tarifa OR tarifs OR preise OR prezzi OR precios OR 料金 OR 요금 OR 收费 OR "$")`;
+
+  const qList = [
+    `"${displayName}" ${core}`,
+    `${displayName} ${core}`,
+    `"${displayName}" (site:.gov OR site:.gov.* OR site:.govt.* OR site:.gouv.* OR site:.go.* OR site:.gob.*) ${core}`,
+    `"${displayName}" (site:.org OR site:.com) (park OR parks OR "national park" OR "state park" OR parc OR parque OR reserve) ${core}`
   ];
 
   try {
     let bestFallback = null;
-    const seenTop = []; // debug: collect top URLs
+    const seenTop = [];
 
-    for (const q of queries) {
+    for (const q of qList) {
       const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=20&country=US&search_lang=en`;
       const sr = await fetch(url, { headers: { "X-Subscription-Token": key, "Accept": "application/json" }});
       if (!sr.ok) continue;
       const data = await sr.json();
       let results = (data.web?.results || []).filter(r => r.url);
 
-      // rank results
+      // rank with name+region strictness
       results.sort((a, b) =>
-        scoreHost(b.url, displayName, query, npsIntent) -
-        scoreHost(a.url, displayName, query, npsIntent)
+        scoreHost(b.url, displayName, query, npsIntent, regionTokens, otherStateTokens) -
+        scoreHost(a.url, displayName, query, npsIntent, regionTokens, otherStateTokens)
       );
 
-      // collect top 10 for debugging
       seenTop.push(...results.slice(0, 10).map(r => r.url));
 
       let checks = 0;
@@ -230,23 +381,35 @@ export async function handler(event) {
 
       for (const r of results) {
         if (checks >= 20) break;
-        const u = new URL(r.url);
+
+        let u;
+        try { u = new URL(r.url); } catch { continue; }
         const host = u.hostname.toLowerCase();
         const path = u.pathname.toLowerCase();
 
-        // coarse relevance
+        // coarse name relevance
         const nameMatch = Math.max(
           tokenSim(displayName, r.title || ""),
-          tokenSim(displayName, host + path)
+          tokenSim(displayName, (host + path))
         );
-        if (nameMatch < 0.20) continue;
+        if (nameMatch < 0.20) { continue; }
         checks++;
 
         const htmlRaw = await fetchText(r.url);
         const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
         const lower = hay.toLowerCase();
 
-        // reject unrelated NPS units
+        // Require region tokens (if provided) to appear somewhere (title/url/body)
+        if (regionTokens.length) {
+          const inHay = regionTokens.some(t => t && lower.includes(t));
+          const inJoined = regionTokens.some(t => t && (host + path).includes(t));
+          if (!inHay && !inJoined) {
+            // not confidently same state/country — skip
+            continue;
+          }
+        }
+
+        // Avoid unrelated NPS units
         if ((host.endsWith("nps.gov") || host === "nps.gov") && path.includes("/planyourvisit/")) {
           if (!isSameNpsUnit(r, displayName)) {
             continue;
@@ -258,7 +421,7 @@ export async function handler(event) {
         const hasFeeWord  = hasAny(lower, FEE_TERMS);
         const hasNoFee    = hasAny(lower, NO_FEE_TERMS);
 
-        // explicit free near entrance
+        // explicit free near entrance/admission
         if (!hasCurrency && hasNoFee && nearEachOther(lower, NO_FEE_TERMS, ENTRANCE_TERMS, 240)) {
           return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
         }
@@ -270,7 +433,7 @@ export async function handler(event) {
           return ok({ url: r.url, feeInfo, kind: "general" });
         }
 
-        // reasonable fallback candidate
+        // fallback candidate if it looks fee-ish or carries slug
         const slug = toSlug(displayName);
         if (!localFallback && (looksLikeFeePath(path) || (slug && path.includes(slug)))) {
           localFallback = r;
@@ -283,7 +446,6 @@ export async function handler(event) {
     }
 
     if (bestFallback) {
-      // include debug list so we can see what Brave returned
       return ok({ ...bestFallback, debugTopUrls: [...new Set(seenTop)].slice(0, 10) });
     }
 
