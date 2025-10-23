@@ -5,6 +5,15 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  # Global timeout for all functions (requires Netlify Pro+ to exceed ~10s)
+  timeout = 26
+  # Optional: bump memory if you need bigger pages
+  # memory = 256
+
+# Per-function override (optional but explicit)
+[functions."search"]
+  timeout = 26
+  # memory = 256
 
 # Route /api/search to our function
 [[redirects]]
