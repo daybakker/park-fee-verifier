@@ -1,6 +1,6 @@
 // Netlify Function: /api/search
-// v24 — Region inference + strict filtering + AllTrails trail URL support
-// Netlify env var required: BRAVE_API_KEY
+// v25 — Strong name-token filtering + region inference + AllTrails support
+// Env var required: BRAVE_API_KEY
 
 /////////////////////////////
 // Multilingual fee signals
@@ -35,7 +35,7 @@ const NO_FEE_TERMS = [
   "gratuit",
   "kostenlos",
   "gratuito","grátis","sem custo",
-  "免费","免費","無料","免费","무료"
+  "免费","免費","無料","무료"
 ];
 
 // Broad currency detector
@@ -210,15 +210,10 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
 
   if (looksLikeFeePath(path)) score += 30;
 
-  // Region match boost
+  // Region boost / wrong-state penalty
   const joined = host + " " + path;
-  for (const t of regionTokens) {
-    if (t && joined.includes(t)) score += 24;
-  }
-  // Wrong-state penalty
-  for (const t of otherStateTokens) {
-    if (t && joined.includes(t)) score -= 40;
-  }
+  for (const t of regionTokens) if (t && joined.includes(t)) score += 24;
+  for (const t of otherStateTokens) if (t && joined.includes(t)) score -= 40;
 
   // Name similarity
   const sim = Math.max(
@@ -228,11 +223,38 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
   );
   score += Math.round(sim * 30);
 
-  // Slug hint
   const slug = toSlug(displayName || query);
   if (slug && path.includes(slug)) score += 25;
 
   return score;
+}
+
+/////////////////////////////
+// Name-token gating (NEW)
+/////////////////////////////
+const GENERIC_NAME_WORDS = new Set([
+  "the","a","an","of","and","or","at","on","in","to","for","by",
+  "park","parks","state","national","provincial","regional","county","city","trail","area","forest","recreation","recreational","natural","nature","reserve","preserve","site"
+]);
+
+function coreNameTokens(name) {
+  return (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g," ")
+    .split(/\s+/)
+    .filter(t => t && !GENERIC_NAME_WORDS.has(t) && t.length >= 3);
+}
+
+// Must contain enough distinctive tokens from the display name
+function passesNameTokenGate(haystack, displayName) {
+  const text = haystack.toLowerCase();
+  const tokens = coreNameTokens(displayName);
+  if (tokens.length === 0) return true; // nothing distinctive to check
+  // Require at least min(3, tokens.length) tokens present
+  const need = Math.min(3, tokens.length);
+  let hit = 0;
+  for (const t of tokens) if (text.includes(t)) hit++;
+  return hit >= need;
 }
 
 /////////////////////////////
@@ -288,7 +310,6 @@ async function extractParkFromAllTrails(url) {
     }
   }
 
-  // pick the most “park-ish” candidate
   const arr = [...candidates];
   arr.sort((a,b) =>
     (/\b(national|state|provincial|regional|county)\b/i.test(b) ? 1 : 0) -
@@ -361,9 +382,7 @@ export async function handler(event) {
     let bestFallback = null;
     let inferredState = null;
 
-    // Helper to process a single batch of results
     const tryBatch = async (queries, requireRegion = false) => {
-      let verified = null;
       for (const q of queries) {
         const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=20&country=US&search_lang=en`;
         const sr = await fetch(url, { headers: { "X-Subscription-Token": key, "Accept": "application/json" }});
@@ -379,7 +398,7 @@ export async function handler(event) {
 
         seenTop.push(...results.slice(0, 10).map(r => r.url));
 
-        // pass 1: when we don't yet know region, tally states we see in candidates
+        // if region unknown, tally states that co-occur
         if (!regionTokens.length) {
           const counts = {};
           for (const r of results.slice(0, 12)) {
@@ -388,12 +407,10 @@ export async function handler(event) {
             if (found) counts[found] = (counts[found] || 0) + 1;
           }
           const top = Object.entries(counts).sort((a,b) => b[1]-a[1])[0];
-          if (top && top[1] >= 2) {
-            inferredState = top[0]; // canonical name
-          }
+          if (top && top[1] >= 2) inferredState = top[0];
         }
 
-        // verification scanning
+        // scan pages
         let checks = 0;
         for (const r of results) {
           if (checks >= 20) break;
@@ -410,15 +427,19 @@ export async function handler(event) {
           checks++;
 
           const htmlRaw = await fetchText(r.url);
-          const hay = `${r.title || ""}\n${r.description || ""}\n${htmlRaw}`;
+          const hay = `${r.title || ""}\n${r.description || ""}\n${r.url}\n${htmlRaw}`;
           const lower = hay.toLowerCase();
+
+          // NEW: strict name-token gate — must contain the distinctive tokens from the park name
+          if (!passesNameTokenGate(hay, displayName)) {
+            continue;
+          }
 
           // Region requirement (if we have one)
           if ((requireRegion || regionTokens.length) && regionTokens.length) {
             const inUrl = regionTokens.some(t => t && (host + path).includes(t));
             const inText = regionTokens.some(t => t && lower.includes(t));
             if (!inUrl && !inText) {
-              // not confidently same region
               continue;
             }
             // Drop obvious wrong-state URLs
@@ -452,19 +473,19 @@ export async function handler(event) {
             return { url: r.url, feeInfo, kind: "general" };
           }
 
-          // fallback if seems relevant to fees
+          // fallback if seems fee-ish
           if (!bestFallback && looksLikeFeePath(path)) {
             bestFallback = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
           }
         }
       }
-      return verified;
+      return null;
     };
 
-    // First pass (may infer a state)
+    // Pass 1
     let found = await tryBatch(qList, false);
 
-    // If no region in input and we inferred a US state from results, re-run strictly with it
+    // If we inferred a state and none provided, re-run strictly with it
     if (!found && inferredState && !regionTokens.length) {
       regionTokens = normalizeRegionTokens(inferredState);
       otherStateTokens = otherUsStateTokens(regionTokens);
@@ -473,8 +494,8 @@ export async function handler(event) {
     }
 
     if (found) return ok(found);
-    if (bestFallback) return ok({ ...bestFallback, debugTopUrls: [...new Set(seenTop)].slice(0, 10) });
-    return ok({ url: null, feeInfo: "Not verified", kind: "not-verified", debugTopUrls: [...new Set(seenTop)].slice(0, 10) });
+    if (bestFallback) return ok({ ...bestFallback });
+    return ok({ url: null, feeInfo: "Not verified", kind: "not-verified" });
 
   } catch (e) {
     return ok({ error: e.message || "Error" });
