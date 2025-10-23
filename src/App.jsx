@@ -2,33 +2,19 @@ import React, { useState } from 'react';
 import { Upload, Download, Search, AlertCircle, CheckCircle, XCircle } from 'lucide-react';
 import Papa from 'papaparse';
 
-/* ----------------------------- Normalization ---------------------------- */
+/* ----------------------------- Small helpers ---------------------------- */
 
-const toNorm = (s) => (s || '')
+const norm = (s) => (s || '')
   .toLowerCase()
-  .replace(/[\u2019']/g, '')        // apostrophes
-  .replace(/[^\p{L}\p{N}\s]/gu, '') // punctuation
+  .replace(/[\u2019']/g, '')
+  .replace(/[^\p{L}\p{N}\s:/._-]/gu, '') // keep URL-ish chars if present
   .replace(/\s+/g, ' ')
   .trim();
 
-// Expand common abbreviations so “SP”, “NP”, etc. group together
-const expand = (s) => {
-  const m = toNorm(s);
-  return m
-    .replace(/\bsp\b/g, 'state park')
-    .replace(/\bnp\b/g, 'national park')
-    .replace(/\bsna\b/g, 'state natural area')
-    .replace(/\bnhp\b/g, 'national historical park')
-    .replace(/\bnf\b/g, 'national forest')
-    .replace(/\bnra\b/g, 'national recreation area')
-    .replace(/\bnwr\b/g, 'national wildlife refuge')
-    .replace(/\bshp\b/g, 'state historic park');
+const isAllTrailsUrl = (s) => {
+  try { return new URL(s).hostname.includes('alltrails.com'); }
+  catch { return false; }
 };
-
-// Make a deterministic group key for “same park”
-const parkKey = (name) => expand(name);
-
-/* --------------------------------- UI ---------------------------------- */
 
 const getAlertDisplay = (alert) => {
   if (alert === 'no fee') return { icon: CheckCircle, color: 'text-green-600', bg: 'bg-green-50' };
@@ -36,34 +22,24 @@ const getAlertDisplay = (alert) => {
   return { icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
 };
 
-const isAllTrailsUrl = (s) => {
-  try { return new URL(s).hostname.includes('alltrails.com'); }
-  catch { return false; }
-};
-
-// Turn the API payload into our three columns
-function toAugment(parkDisplay, api) {
-  const url = api?.url || api?.homepage || '';           // prefer direct fee URL, else homepage if provided
+const toAugment = (displayName, api) => {
   const kind = api?.kind || 'not-verified';
+  const url = api?.url || api?.homepage || '';
   const feeInfo = api?.feeInfo || (kind === 'no-fee' ? 'No fee' : 'Not verified');
 
   let alert = 'unverified';
   if (kind === 'no-fee') {
     alert = 'no fee';
-  } else if (kind === 'general' || kind === 'parking') {
-    // Only two alert templates you asked to keep
-    if (kind === 'parking') {
-      // trailhead/lot case
-      alert = `There is a fee to park at ${parkDisplay}. For more information, please visit ${url}.`;
-    } else {
-      // general “entrance fee”
-      alert = `${parkDisplay} charges a fee to enter. For more information, please visit ${url}.`;
-    }
+  } else if (kind === 'general') {
+    alert = `${displayName} charges a fee to enter. For more information, please visit ${url}.`;
+  } else if (kind === 'parking') {
+    alert = `There is a fee to park at ${displayName}. For more information, please visit ${url}.`;
   }
-  return { feeInfo, feeSource: url, alert, kind };
-}
 
-/* --------------------------- Backend Lookups --------------------------- */
+  return { feeInfo, feeSource: url, alert, kind };
+};
+
+/* ------------------------------ API calls ------------------------------ */
 
 async function callSearch({ query, state, nameForMatch, lenient }) {
   try {
@@ -75,7 +51,7 @@ async function callSearch({ query, state, nameForMatch, lenient }) {
         state,
         nameForMatch,
         lenient: !!lenient,
-        wantHomepage: true // optional convenience for “always include a source”
+        wantHomepage: true
       })
     });
     return await res.json();
@@ -84,23 +60,18 @@ async function callSearch({ query, state, nameForMatch, lenient }) {
   }
 }
 
-// One grouped lookup with strict->lenient retries
-async function lookupGroup({ query, state, nameForMatch }) {
-  // strict pass
+async function lookupWithRetry({ query, state, nameForMatch }) {
+  // strict
   const strict = await callSearch({ query, state, nameForMatch, lenient: false });
   if (strict && strict.kind !== 'not-verified') return strict;
 
-  // lenient pass, broaden keywords (.gov/.org + admission/fees/day-use, etc.)
-  // NOTE: we widen in the *backend*, but as an extra hint we can also append keywords here.
-  const fallbackQuery = isAllTrailsUrl(query)
-    ? query
-    : `${query} (admission OR fees OR "day-use" OR parking)`;
-
-  const lenient = await callSearch({ query: fallbackQuery, state, nameForMatch, lenient: true });
+  // lenient (append fee-ish keywords unless it’s a URL)
+  const q2 = isAllTrailsUrl(query) ? query : `${query} (admission OR fees OR "day-use" OR parking)`;
+  const lenient = await callSearch({ query: q2, state, nameForMatch, lenient: true });
   return lenient || { url: null, feeInfo: 'Not verified', kind: 'not-verified' };
 }
 
-/* --------------------------------- App --------------------------------- */
+/* --------------------------------- UI ---------------------------------- */
 
 const App = () => {
   const [inputMode, setInputMode] = useState('single');
@@ -109,7 +80,8 @@ const App = () => {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
-  /* ------------------------------- Single ------------------------------- */
+  /* --------------------------- Single Search --------------------------- */
+
   const processSingle = async () => {
     const raw = (singleInput || '').trim();
     if (!raw) return;
@@ -118,19 +90,19 @@ const App = () => {
     setProgress({ current: 0, total: 1 });
 
     try {
-      const query = raw; // name or AllTrails URL
+      const query = raw;
       const nameForMatch = isAllTrailsUrl(raw) ? undefined : raw;
 
-      const api = await lookupGroup({ query, state: undefined, nameForMatch });
-      const augment = toAugment(raw, api);
+      const api = await lookupWithRetry({ query, state: undefined, nameForMatch });
+      const aug = toAugment(raw, api);
 
       setResults([{
         name: raw,
         state: '-',
         agency: '-',
-        'Fee Info': augment.feeInfo,
-        'Fee Source': augment.feeSource,
-        'Alert': augment.alert
+        'Fee Info': aug.feeInfo,
+        'Fee Source': aug.feeSource,
+        'Alert': aug.alert
       }]);
 
       setProgress({ current: 1, total: 1 });
@@ -139,29 +111,30 @@ const App = () => {
     }
   };
 
-  /* -------------------------------- Batch ------------------------------- */
+  /* ------------------------------ CSV Batch ---------------------------- */
 
-  // Build a minimal “group model” so a group gets exactly one lookup + a lenient retry
-  function groupRows(rows) {
-    const groups = new Map(); // key -> { displayName, rowsIdx:[], state?, firstQuery }
-    rows.forEach((row, idx) => {
-      const name = row.name || row.trail_name || row.park || row['Park Name'] || row.Park || '';
-      const url = row.url || row.link || '';
-      const display = name || url || `Row ${idx+1}`;
-      const key = parkKey(name || url);
+  // Build deduped tasks keyed by normalized query (name or URL)
+  function buildTasks(rows) {
+    const tasks = new Map(); // key -> { query, state?, nameForMatch?, idxs:[], display }
+    rows.forEach((r, idx) => {
+      const name = r.name || r.trail_name || r.park || r['Park Name'] || r.Park || '';
+      const url = r.url || r.link || '';
+      const query = url && isAllTrailsUrl(url) ? url : (name || url);
+      if (!query) return;
 
-      if (!groups.has(key)) {
-        groups.set(key, {
-          key,
-          displayName: display,
-          state: row.state || row.State || undefined,
-          query: url ? url : name,  // prefer URL if present (AllTrails)
-          rowsIdx: []
+      const key = norm(query);
+      if (!tasks.has(key)) {
+        tasks.set(key, {
+          query,
+          state: r.state || r.State || undefined,
+          nameForMatch: isAllTrailsUrl(query) ? undefined : name || query,
+          display: name || query,
+          idxs: []
         });
       }
-      groups.get(key).rowsIdx.push(idx);
+      tasks.get(key).idxs.push(idx);
     });
-    return groups;
+    return tasks;
   }
 
   const processCSV = async (file) => {
@@ -170,90 +143,65 @@ const App = () => {
       skipEmptyLines: true,
       complete: async (parsed) => {
         const rows = parsed.data || [];
-        if (rows.length === 0) { setResults([]); return; }
+        if (!rows.length) { setResults([]); return; }
 
         setProcessing(true);
-        setProgress({ current: 0, total: rows.length });
 
-        // 1) Build groups so each park gets a single canonical lookup
-        const groups = groupRows(rows);
+        // Dedup per unique query (park name or AllTrails URL)
+        const tasks = buildTasks(rows);
+        const taskList = Array.from(tasks.values());
 
-        // 2) Resolve each group (strict->lenient), cache per group
-        const groupResults = new Map(); // key -> {feeInfo, feeSource, alert, kind}
+        // Progress: we report in *rows*, not groups.
+        const totalRows = rows.length;
+        setProgress({ current: 0, total: totalRows });
+        let doneRows = 0;
 
-        // Small worker pool to control concurrency
-        const keys = Array.from(groups.keys());
-        let ptr = 0;
+        // Where we'll put answers per task
+        const answers = new Map(); // key (norm(query)) -> augment
+
+        // Concurrency control
         const CONCURRENCY = 4;
+        let i = 0;
 
         const runWorker = async () => {
           while (true) {
-            const i = ptr++; if (i >= keys.length) break;
-            const g = groups.get(keys[i]);
+            const my = i++; if (my >= taskList.length) break;
+            const t = taskList[my];
 
-            // One lookup per group
-            const api = await lookupGroup({
-              query: g.query,
-              state: g.state,
-              nameForMatch: isAllTrailsUrl(g.query) ? undefined : g.displayName
+            // strict -> lenient
+            const api = await lookupWithRetry({
+              query: t.query,
+              state: t.state,
+              nameForMatch: t.nameForMatch
             });
 
-            groupResults.set(g.key, toAugment(g.displayName, api));
+            const aug = toAugment(t.display, api);
+            answers.set(norm(t.query), aug);
+
+            // Progress bump by number of rows this task covers
+            doneRows += t.idxs.length;
+            setProgress({ current: Math.min(doneRows, totalRows), total: totalRows });
           }
         };
-        await Promise.all(new Array(Math.min(CONCURRENCY, keys.length)).fill(0).map(runWorker));
 
-        // 3) First fill using group results
+        await Promise.all(new Array(Math.min(CONCURRENCY, taskList.length)).fill(0).map(runWorker));
+
+        // Build output by copying the task’s single answer into all its rows
         const out = rows.map((row, idx) => {
           const name = row.name || row.trail_name || row.park || row['Park Name'] || row.Park || '';
           const url = row.url || row.link || '';
-          const display = name || url || `Row ${idx+1}`;
-          const key = parkKey(name || url);
-          const g = groupResults.get(key);
+          const query = url && isAllTrailsUrl(url) ? url : (name || url);
+          const key = norm(query || '');
 
-          const feeInfo = g?.feeInfo || 'Not verified';
-          const feeSource = g?.feeSource || '';
-          const alert = g?.alert || 'unverified';
-
-          // progress tick
-          setProgress(p => ({ current: Math.min(p.current + 1, p.total), total: p.total }));
+          const ans = key ? answers.get(key) : null;
 
           return {
             ...row,
-            'Fee Info': feeInfo,
-            'Fee Source': feeSource,
-            'Alert': alert
+            'Fee Info': ans?.feeInfo || 'Not verified',
+            'Fee Source': ans?.feeSource || '',
+            'Alert': ans?.alert || 'unverified'
           };
         });
-
-        // 4) Group backfill: if any row in a group is verified, copy to all rows in the same group
-        //    This removes the “one unverified among identical names” problem.
-        for (const [key, group] of groups.entries()) {
-          const idxs = group.rowsIdx;
-          const best = idxs
-            .map(i => out[i])
-            .map(r => ({
-              i: r,
-              score:
-                (r['Alert'] === 'no fee' ? 3 :
-                (r['Alert'] && r['Alert'] !== 'unverified' ? 2 :
-                (r['Fee Source'] ? 1 : 0))) // prefer verified w/fee, then no-fee, then homepage, then none
-            }))
-            .sort((a,b) => b.score - a.score)[0];
-
-          if (best && best.score > 1) { // has a verified fee alert (2 or 3)
-            idxs.forEach(i => {
-              out[i]['Fee Info'] = best.i['Fee Info'];
-              out[i]['Fee Source'] = best.i['Fee Source'];
-              out[i]['Alert'] = best.i['Alert'];
-            });
-          } else if (best && best.score === 1) {
-            // we have at least a homepage source — keep consistency
-            idxs.forEach(i => {
-              if (!out[i]['Fee Source']) out[i]['Fee Source'] = best.i['Fee Source'];
-            });
-          }
-        }
 
         setResults(out);
         setProcessing(false);
@@ -266,10 +214,10 @@ const App = () => {
   };
 
   const handleFileUpload = (e) => {
-    const file = e.target.files?.[0];
-    if (file) {
+    const f = e.target.files?.[0];
+    if (f) {
       setInputMode('batch');
-      processCSV(file);
+      processCSV(f);
     }
   };
 
@@ -377,7 +325,7 @@ const App = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200">
-                  {results.slice(0, 1500).map((r, idx) => {
+                  {results.slice(0, 2000).map((r, idx) => {
                     const alertText = r.Alert || 'unverified';
                     const { icon: Icon, color, bg } = getAlertDisplay(alertText);
                     const displayName = r.name || r.trail_name || r.park || r['Park Name'] || r.Park || '-';
@@ -407,9 +355,9 @@ const App = () => {
               </table>
             </div>
 
-            {results.length > 1500 && (
+            {results.length > 2000 && (
               <p className="text-sm text-gray-600 mt-4 text-center">
-                Showing first 1500 results. Download CSV for the complete data.
+                Showing first 2000 results. Download CSV for the complete data.
               </p>
             )}
           </div>
