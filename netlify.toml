@@ -6,10 +6,6 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
-# Add this new section just for the "search" function
-[functions."search"]
-  timeout = 26
-
 # Route /api/search to our function
 [[redirects]]
   from = "/api/search"
