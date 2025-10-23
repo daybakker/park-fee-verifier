@@ -133,9 +133,7 @@ const ParkFeeVerifier = () => {
     } else if (feeInfo === 'Not verified' || !source) {
       alert = 'unverified';
     } else if (kind === 'parking') {
-      alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;
-    } else if (kind === 'vehicle') {
-      alert = `${baseName} charges a fee to enter. The fee varies depending on the vehicle used to enter the park (car, motorcycle, bike, on foot, or on horseback). For more information, please visit ${source}.`;
+      alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;\
     } else {
       alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
     }
