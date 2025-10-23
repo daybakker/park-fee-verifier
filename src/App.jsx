@@ -3,18 +3,27 @@ import React, { useState } from 'react';
 import { Upload, Download, Search, AlertCircle, CheckCircle, XCircle } from 'lucide-react';
 import Papa from 'papaparse';
 
-/* ------------------ tiny utils ------------------ */
-const norm = (s) => (s||'').toLowerCase().replace(/[\u2019']/g,'').replace(/[^\p{L}\p{N}\s:/._-]/gu,' ').replace(/\s+/g,' ').trim();
-const isAllTrailsUrl = (s) => { try { return new URL(s).hostname.includes('alltrails.com'); } catch { return false; } };
-const cleanAT = (u) => { try { const x=new URL(u); return `https://${x.hostname}${x.pathname.replace(/\/+$/,'')}`; } catch { return u; } };
+const norm = (s) => (s||'').toLowerCase()
+  .replace(/[\u2019']/g,'')
+  .replace(/[^\p{L}\p{N}\s:/._-]/gu,' ')
+  .replace(/\s+/g,' ')
+  .trim();
 
-const getAlertBadge = (alert) => {
+const isAllTrailsUrl = (s) => {
+  try { return new URL(s).hostname.includes('alltrails.com'); }
+  catch { return false; }
+};
+const cleanAT = (u) => {
+  try { const x=new URL(u); return `https://${x.hostname}${x.pathname.replace(/\/+$/,'')}`; }
+  catch { return u; }
+};
+
+const getBadge = (alert) => {
   if (alert === 'no fee') return { Icon: CheckCircle, color: 'text-green-600', bg: 'bg-green-50' };
   if (alert === 'unverified') return { Icon: XCircle, color: 'text-gray-600', bg: 'bg-gray-50' };
   return { Icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
 };
 
-/* ------------------ API ------------------ */
 async function callSearch({ query, state, nameForMatch, lenient }) {
   try {
     const r = await fetch('/api/search', {
@@ -27,16 +36,15 @@ async function callSearch({ query, state, nameForMatch, lenient }) {
     return { url:null, homepage:null, feeInfo:'Not verified', kind:'not-verified' };
   }
 }
-async function lookupLooser(query, state, nameForMatch) {
+async function lookupAggressive(query, state, nameForMatch) {
   // strict
-  let res = await callSearch({ query, state, nameForMatch, lenient: false });
+  let res = await callSearch({ query, state, nameForMatch, lenient:false });
   if (res && res.kind !== 'not-verified') return res;
   // lenient
   const q2 = isAllTrailsUrl(query) ? query : `${query} (admission OR tickets OR fees OR "day-use" OR pass OR parking)`;
-  res = await callSearch({ query: q2, state, nameForMatch, lenient: true });
+  res = await callSearch({ query: q2, state, nameForMatch, lenient:true });
   return res;
 }
-
 function toAugment(displayName, api) {
   const kind = api?.kind || 'not-verified';
   const url = api?.url || api?.homepage || '';
@@ -49,12 +57,10 @@ function toAugment(displayName, api) {
     alert = `${displayName} charges a fee to enter. For more information, please visit ${url}.`;
   } else if (kind === 'parking') {
     alert = `There is a fee to park at ${displayName}. For more information, please visit ${url}.`;
-  } // homepage/not-verified stay "unverified"
-
+  }
   return { feeInfo, feeSource: url, alert, kind };
 }
 
-/* ------------------ App ------------------ */
 export default function App() {
   const [inputMode, setInputMode] = useState('single');
   const [singleInput, setSingleInput] = useState('');
@@ -62,14 +68,12 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
-  /* single */
   const processSingle = async () => {
     const raw = (singleInput||'').trim();
     if (!raw) return;
     setProcessing(true); setProgress({current:0,total:1});
     try {
-      const query = raw;
-      const res = await lookupLooser(query, undefined, isAllTrailsUrl(query)? undefined : raw);
+      const res = await lookupAggressive(raw, undefined, isAllTrailsUrl(raw)? undefined : raw);
       const aug = toAugment(raw, res);
       setResults([{
         name: raw, state: '-', agency: '-',
@@ -79,16 +83,15 @@ export default function App() {
     } finally { setProcessing(false); }
   };
 
-  /* batch */
   const processCSV = async (file) => {
     Papa.parse(file, {
       header:true, skipEmptyLines:true,
       complete: async (parsed) => {
         const rows = parsed.data || [];
         if (!rows.length) { setResults([]); return; }
-        setProcessing(true);
 
-        // group by normalized query (park name OR AllTrails URL)
+        setProcessing(true);
+        // exact de-dupe key: same AT-URL or same normalized name
         const groups = new Map(); // key -> { display, state, query, idxs:[] }
         rows.forEach((r, i) => {
           const name = r.name || r.trail_name || r.park || r['Park Name'] || r.Park || '';
@@ -103,29 +106,30 @@ export default function App() {
         });
 
         const keys = Array.from(groups.keys());
-        const out = rows.map(r => ({ ...r })); // clone
-        setProgress({ current: 0, total: rows.length });
-        let done = 0;
+        const out = rows.map(r => ({ ...r }));
+        const totalRows = rows.length;
+        setProgress({ current: 0, total: totalRows });
 
-        // do lookups (one per group), then copy to all group rows
-        const CONCURRENCY = 4;
-        let ptr = 0;
+        // Low concurrency to respect Brave/API limits
+        const CONCURRENCY = 2;
+        let ptr = 0, done = 0;
+
         const run = async () => {
           while (true) {
             const k = keys[ptr++]; if (k === undefined) break;
             const g = groups.get(k);
-            const res = await lookupLooser(g.query, g.state, isAllTrailsUrl(g.query)? undefined : g.display);
-            const aug = toAugment(g.display, res);
 
-            // copy to all rows in group
+            const api = await lookupAggressive(g.query, g.state, isAllTrailsUrl(g.query)? undefined : g.display);
+            const aug = toAugment(g.display, api);
+
+            // copy to all rows in this group
             for (const idx of g.idxs) {
               out[idx]['Fee Info'] = aug.feeInfo;
               out[idx]['Fee Source'] = aug.feeSource;
               out[idx]['Alert'] = aug.alert;
             }
-            // progress increments by group size
             done += g.idxs.length;
-            setProgress({ current: Math.min(done, rows.length), total: rows.length });
+            setProgress({ current: Math.min(done, totalRows), total: totalRows });
           }
         };
         await Promise.all(new Array(Math.min(CONCURRENCY, keys.length)).fill(0).map(run));
@@ -151,7 +155,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  /* render */
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 p-6">
       <div className="max-w-7xl mx-auto">
@@ -162,10 +165,15 @@ export default function App() {
           <div className="flex gap-4 mb-6">
             <button
               onClick={() => setInputMode('single')}
-              className={`flex-1 py-3 px-4 rounded-lg font-medium transition ${inputMode==='single'?'bg-blue-600 text-white':'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
+              className={`flex-1 py-3 px-4 rounded-lg font-medium transition ${
+                inputMode==='single' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              }`}>
               <Search className="inline mr-2" size={20}/> Single Search
             </button>
-            <label className={`flex-1 py-3 px-4 rounded-lg font-medium transition text-center cursor-pointer ${inputMode==='batch'?'bg-blue-600 text-white':'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
+
+            <label className={`flex-1 py-3 px-4 rounded-lg font-medium transition text-center cursor-pointer ${
+              inputMode==='batch' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+            }`}>
               <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload}/>
               <Upload className="inline mr-2" size={20}/> CSV Batch Upload
             </label>
@@ -179,7 +187,9 @@ export default function App() {
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 onKeyDown={(e)=>e.key==='Enter' && processSingle()}
               />
-              <button onClick={processSingle} disabled={processing || !singleInput.trim()}
+              <button
+                onClick={processSingle}
+                disabled={processing || !singleInput.trim()}
                 className="w-full bg-blue-600 text-white py-3 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition">
                 {processing ? 'Verifying…' : 'Verify Fees'}
               </button>
@@ -223,7 +233,7 @@ export default function App() {
                 <tbody className="divide-y divide-gray-200">
                   {results.map((r, idx) => {
                     const alertText = r.Alert || 'unverified';
-                    const { Icon, color, bg } = getAlertBadge(alertText);
+                    const { Icon, color, bg } = getBadge(alertText);
                     const displayName = r.name || r.trail_name || r.park || r['Park Name'] || r.Park || '-';
                     return (
                       <tr key={idx} className="hover:bg-gray-50">
@@ -246,6 +256,7 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+
           </div>
         )}
       </div>
