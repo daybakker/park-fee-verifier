@@ -1,8 +1,4 @@
-// Netlify Function: /api/search (v9 — prefer state-park pages like TPWD; generic alert)
-// - Scores by domain trust, path hints (/state-parks/), host hints (tpwd), and name slug match
-// - Penalizes NPS unless the unit clearly matches the query
-// - Parses NPS fee tables + generic ADMISSION/$
-// - Stops after 4 checked pages
+// Netlify Function: /api/search (v10 — fixed await placement + TPWD/state-park targeting)
 
 const ENTRANCE_TERMS = ["entrance","admission","day-use","day use","entry","gate"];
 const FEE_TERMS = [
@@ -15,12 +11,12 @@ const NO_FEE_TERMS = [
 ];
 
 // ---------- utils ----------
-function toSlug(s="") {
+function toSlug(s = "") {
   return s
     .toLowerCase()
-    .normalize("NFKD").replace(/[\u0300-\u036f]/g,"")
-    .replace(/[^a-z0-9]+/g,"-")
-    .replace(/^-+|-+$/g,"");
+    .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function tokenSim(a, b) {
@@ -44,7 +40,6 @@ function findDollarAmounts(text) {
 }
 
 function extractAmount(text) {
-  // "$5 per person", "$35", "$10 per vehicle"
   const m = text.match(/\$\s?(\d{1,3})(\.\d{2})?\s*(per\s*(vehicle|car|person|adult|child|motorcycle|bike))?/i);
   if (!m) return null;
   const dollars = `$${m[1]}${m[2] ?? ""}`;
@@ -53,7 +48,6 @@ function extractAmount(text) {
 }
 
 function extractAdmissionBlock(text) {
-  // e.g. "ADMISSION $3 adults; $1.50 seniors; ..."
   const m = text.match(/admission[^.\n\r:<]*[:\-]?\s*(?:<[^>]*>)*\s*(\$[^.\n\r<]+)/i);
   if (!m) return null;
   const anyAmt = extractAmount(m[0]);
@@ -104,7 +98,7 @@ function looksLikeFeePath(path) {
     path.includes("/rates") ||
     path.includes("/pricing") ||
     path.includes("/fees-facilities") ||
-    path.includes("/state-parks/") // <-- big boost for TPWD & many states
+    path.includes("/state-parks/")
   );
 }
 
@@ -113,7 +107,7 @@ function detectNpsIntent(q) {
   return /\bnps\b|national park|national monument|national recreation area|national preserve/.test(s);
 }
 
-// Domain scoring (no per-state list; uses hints instead)
+// Domain scoring (hints for state/county park pages, penalize unrelated NPS)
 function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   let score = 0;
   let host = "", path = "";
@@ -128,62 +122,35 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   const tldOrg = host.endsWith(".org");
   const tldCom = host.endsWith(".com");
 
-  // Strongly prefer federal official, but only if intended
   if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 80 : 10);
   if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
-  if (host === ".gov" || host.endsWith(".gov")) score += 60;
-  if (host.includes("tpwd")) score += 40;
-  if (path.includes("/state-parks/")) score += 40;
-  if (path.includes ("statepark")) score +=40;
   if (tldGov) score += 50;
 
-  // Semi-official/local: park-ish keywords
   const parkish = /stateparks|parks|parkandrec|recreation|recdept|dnr|naturalresources|county|city|tpwd|parksandwildlife/.test(host);
   if (tldUs)  score += 30;
   if (tldOrg && parkish) score += 26;
   if (tldCom && parkish) score += 24;
 
-  // Big hints for state-park fee pages
   if (looksLikeFeePath(path)) score += 28;
-  if (host.includes("tpwd")) score += 35;              // Texas Parks & Wildlife
-  if (path.includes("/state-parks/")) score += 32;     // Many states use this
+  if (host.includes("tpwd")) score += 40;            // TPWD
+  if (path.includes("/state-parks/")) score += 40;   // Many states (incl. TPWD)
 
-  // Fuzzy match to name (host/path/title/query)
   const sim = Math.max(
     tokenSim(nameForMatch, host),
     tokenSim(nameForMatch, path),
     tokenSim(nameForMatch, query)
   );
-  score += Math.round(sim * 30); // up to +30
+  score += Math.round(sim * 30);
 
-  // If query does NOT look like NPS and host is nps.gov → penalize a lot
   if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) score -= 60;
 
-  // Extra bonus if the park slug appears in the path
- if (slug && path.includes(slug)) {
-  // try to parse immediately
-  const htmlRaw = await fetchText(r.url);
-  const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
-  const lower = hay.toLowerCase();
+  const slug = toSlug(nameForMatch || query);
+  if (slug && path.includes(slug)) score += 20;
 
-  // admission block
-  if (lower.includes("admission")) {
-    const adm = extractAdmissionBlock(hay);
-    if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
-  }
-  // generic $/fee detection
-  const amounts = findDollarAmounts(hay);
-  if (amounts.length || /entrance fee|admission|day\-use|\$/.test(lower)) {
-    const feeInfo = extractAmount(hay) || "Fee charged";
-    return ok({ url: r.url, feeInfo, kind: "general" });
-  }
-  // explicit “no fee” near entrance words
-  if (/no fee|free/.test(lower) && nearEachOther(lower, ["no fee","free"], ["entrance","admission","day-use"])) {
-    return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
-  }
+  return score;
 }
-  
+
 function buildScope(stateCode) {
   const base = [
     "site:.gov","site:.us","site:.org","site:.com",
@@ -211,22 +178,21 @@ export async function handler(event) {
 
   let body = {};
   try { body = JSON.parse(event.body || "{}"); } catch {}
-  const { query, state=null, nameForMatch=null } = body;
+  const { query, state = null, nameForMatch = null } = body;
   if (!query) return ok({ error: "Missing query" });
 
   const scope = buildScope(state);
   const baseQ = `${query} ${scope} (admission OR "entrance fee" OR "$" OR "day-use" OR "parking fee")`;
-
-  // Try two queries: general + fee-path focused (improves TPWD/other states)
   const queries = [
     baseQ,
     `${query} ${scope} ("/state-parks/" OR "/fees-facilities/" OR "/fees")`
   ];
 
   const npsIntent = detectNpsIntent(query);
+  const parkSlug = toSlug(nameForMatch || query);
 
   try {
-    let bestPayload = null;
+    let bestFallback = null;
 
     for (const q of queries) {
       const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=12&country=US&search_lang=en`;
@@ -235,35 +201,33 @@ export async function handler(event) {
       const data = await sr.json();
       let results = (data.web?.results || []).filter(r => r.url);
 
-      // Score & sort
       results.sort((a, b) =>
         scoreHost(b.url, nameForMatch || query, query, npsIntent) -
         scoreHost(a.url, nameForMatch || query, query, npsIntent)
       );
 
-      let fallback = null;
       let checks = 0;
+      let localFallback = null;
 
       for (const r of results) {
-        if (checks >= 10) break;
-
+        if (checks >= 10) break; // inspect more results
         const u = new URL(r.url);
         const host = u.hostname.toLowerCase();
         const path = u.pathname.toLowerCase();
 
-        // Require loose name match to avoid unrelated units (e.g., REDW vs San Angelo)
         const nameMatch = Math.max(
           tokenSim(nameForMatch || query, r.title || ""),
           tokenSim(nameForMatch || query, host + path)
         );
-        if (nameMatch < 0.20) { continue; }
+        if (nameMatch < 0.20) { continue; } // more lenient
 
         checks++;
+
         const htmlRaw = await fetchText(r.url);
         const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
         const lower = hay.toLowerCase();
 
-        // NPS structured extraction (only when it's actually NPS and looks like fees)
+        // NPS: only if looks like actual fee page
         if ((host.endsWith("nps.gov") || host === "nps.gov") && path.includes("/planyourvisit/")) {
           if (lower.includes("entrance fee")) {
             const npsHit = npsExtractEntranceFees(hay);
@@ -273,7 +237,7 @@ export async function handler(event) {
           }
         }
 
-        // Admission block (e.g., many state/county sites)
+        // Admission block (state/county pages)
         if (lower.includes("admission")) {
           const adm = extractAdmissionBlock(hay);
           if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
@@ -295,16 +259,20 @@ export async function handler(event) {
           return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
         }
 
-        fallback = fallback || r;
+        // Prefer a fallback that still looks close (slug match)
+        if (!localFallback) {
+          if ((parkSlug && path.includes(parkSlug)) || looksLikeFeePath(path)) {
+            localFallback = r;
+          }
+        }
       }
 
-      // keep best fallback across queries
-      if (fallback && !bestPayload) {
-        bestPayload = { url: fallback.url, feeInfo: "Not verified", kind: "not-verified" };
+      if (localFallback && !bestFallback) {
+        bestFallback = { url: localFallback.url, feeInfo: "Not verified", kind: "not-verified" };
       }
     }
 
-    if (bestPayload) return ok(bestPayload);
+    if (bestFallback) return ok(bestFallback);
     return ok({ url: null, feeInfo: "Not verified", kind: "not-verified" });
 
   } catch (e) {
