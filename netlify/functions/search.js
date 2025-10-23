@@ -1,5 +1,5 @@
 // Netlify Function: /api/search
-// v25 — Strong name-token filtering + region inference + AllTrails support
+// v26 — Robust AllTrails extractor (__NEXT_DATA__), strong name-token filter, region inference
 // Env var required: BRAVE_API_KEY
 
 /////////////////////////////
@@ -230,7 +230,7 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
 }
 
 /////////////////////////////
-// Name-token gating (NEW)
+// Name-token gating
 /////////////////////////////
 const GENERIC_NAME_WORDS = new Set([
   "the","a","an","of","and","or","at","on","in","to","for","by",
@@ -245,12 +245,11 @@ function coreNameTokens(name) {
     .filter(t => t && !GENERIC_NAME_WORDS.has(t) && t.length >= 3);
 }
 
-// Must contain enough distinctive tokens from the display name
+// Require at least min(3, tokens.length) distinctive tokens to appear
 function passesNameTokenGate(haystack, displayName) {
   const text = haystack.toLowerCase();
   const tokens = coreNameTokens(displayName);
-  if (tokens.length === 0) return true; // nothing distinctive to check
-  // Require at least min(3, tokens.length) tokens present
+  if (tokens.length === 0) return true;
   const need = Math.min(3, tokens.length);
   let hit = 0;
   for (const t of tokens) if (text.includes(t)) hit++;
@@ -258,67 +257,100 @@ function passesNameTokenGate(haystack, displayName) {
 }
 
 /////////////////////////////
-// AllTrails extractors
+// AllTrails extractors (ROBUST)
 /////////////////////////////
+function collectNamesFromJson(obj, out = new Set()) {
+  if (!obj) return out;
+  if (Array.isArray(obj)) { obj.forEach(it => collectNamesFromJson(it, out)); return out; }
+  if (typeof obj === "object") {
+    for (const [k,v] of Object.entries(obj)) {
+      if (k === "name" && typeof v === "string" && v.length <= 120) out.add(v);
+      // Common AllTrails fields that hold display names:
+      if (typeof v === "string" && /park|forest|preserve|reserve|recreation|national|state/i.test(v) && v.length <= 140) {
+        out.add(v);
+      }
+      collectNamesFromJson(v, out);
+    }
+  }
+  return out;
+}
+
+function pickMostParkLikeName(names) {
+  const arr = [...names];
+  // Prefer names with explicit park keywords and more specific qualifiers
+  const score = (n) => {
+    const s = n.toLowerCase();
+    let sc = 0;
+    if (/\b(national|state|provincial|regional|county)\b/.test(s)) sc += 5;
+    if (/\bpark\b/.test(s)) sc += 5;
+    if (/forest|preserve|reserve|recreation/.test(s)) sc += 3;
+    sc += Math.min(4, coreNameTokens(n).length); // distinctiveness
+    return sc;
+  };
+  arr.sort((a,b) => score(b) - score(a));
+  return arr[0] || null;
+}
+
 async function extractParkFromAllTrails(url) {
   const html = await fetchText(url);
   if (!html) return { parkName: null, region: null };
 
-  const candidates = new Set();
+  // 1) __NEXT_DATA__ (Next.js) — the most reliable
+  const nextMatch = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+  if (nextMatch) {
+    try {
+      const data = JSON.parse(nextMatch[1]);
+      const names = collectNamesFromJson(data);
+      const best = pickMostParkLikeName(names);
+      const region =
+        detectStateInString(JSON.stringify(data)) ||
+        guessStateFromAllTrailsUrl(url) ||
+        detectStateInString(html) ||
+        null;
+      if (best) return { parkName: best, region };
+    } catch {}
+  }
 
-  // park anchor e.g. /park/us/louisiana/sam-houston-jones-state-park
+  // 2) JSON-LD blocks
+  const ldjsonRegex = /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+  let block;
+  let namesLD = new Set();
+  while ((block = ldjsonRegex.exec(html)) !== null) {
+    try {
+      const json = JSON.parse(block[1]);
+      collectNamesFromJson(json, namesLD);
+    } catch {}
+  }
+  if (namesLD.size) {
+    const best = pickMostParkLikeName(namesLD);
+    const region =
+      detectStateInString(html) ||
+      guessStateFromAllTrailsUrl(url) ||
+      null;
+    if (best) return { parkName: best, region };
+  }
+
+  // 3) Park anchor slug fallback
+  const candidates = new Set();
   const parkAnchor = /https?:\/\/www\.alltrails\.com\/park\/[^"]+\/([a-z0-9\-]+)"/gi;
   let m;
   while ((m = parkAnchor.exec(html)) !== null) {
     const slug = (m[1] || "").replace(/-/g, " ");
     if (slug) candidates.add(slug.replace(/\b\w/g, c => c.toUpperCase()));
   }
-
-  // visible anchor text after park link (fallback)
-  const parkAnchorText = /<a[^>]+href="https?:\/\/www\.alltrails\.com\/park\/[^"]+"[^>]*>([^<]{3,120})<\/a>/gi;
-  let m2;
-  while ((m2 = parkAnchorText.exec(html)) !== null) {
-    const name = (m2[1] || "").replace(/\s+/g, " ").trim();
-    if (name && !/alltrails/i.test(name)) candidates.add(name);
+  if (candidates.size) {
+    return { parkName: pickMostParkLikeName(candidates), region: guessStateFromAllTrailsUrl(url) || detectStateInString(html) || null };
   }
 
-  // JSON-LD fallback
-  if (candidates.size === 0) {
-    const ldjsonRegex = /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
-    let block;
-    let mm;
-    while ((mm = ldjsonRegex.exec(html)) !== null) {
-      block = mm[1];
-      try {
-        const data = JSON.parse(block);
-        const names = [];
-        const crawl = (obj) => {
-          if (!obj) return;
-          if (Array.isArray(obj)) return obj.forEach(crawl);
-          if (typeof obj === "object") {
-            if (typeof obj.name === "string") names.push(obj.name);
-            Object.values(obj).forEach(crawl);
-          }
-        };
-        crawl(data);
-        for (const n of names) {
-          if (/park|parc|parque|reserve|preserve|forest|national/i.test(n)) {
-            candidates.add(n);
-          }
-        }
-      } catch {}
-    }
+  // 4) Title fallback
+  const title = (html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || "").replace(/\s+\|.*$/,"").trim();
+  const titleCand = /(.+?)\s*-\s*AllTrails/i.test(title) ? RegExp.$1 : title;
+  if (titleCand) {
+    const region = guessStateFromAllTrailsUrl(url) || detectStateInString(html) || null;
+    return { parkName: titleCand, region };
   }
 
-  const arr = [...candidates];
-  arr.sort((a,b) =>
-    (/\b(national|state|provincial|regional|county)\b/i.test(b) ? 1 : 0) -
-    (/\b(national|state|provincial|regional|county)\b/i.test(a) ? 1 : 0)
-  );
-
-  const region = guessStateFromAllTrailsUrl(url) || detectStateInString(html) || null;
-  const parkName = arr[0] || null;
-  return { parkName, region };
+  return { parkName: null, region: guessStateFromAllTrailsUrl(url) || detectStateInString(html) || null };
 }
 
 /////////////////////////////
@@ -355,7 +387,6 @@ export async function handler(event) {
     if (parkName) nameForMatch = parkName;
     if (region && !state) state = region;
     if (!nameForMatch) {
-      // last slug hint
       try {
         const u = new URL(query);
         const parts = u.pathname.split("/").filter(Boolean);
@@ -430,22 +461,15 @@ export async function handler(event) {
           const hay = `${r.title || ""}\n${r.description || ""}\n${r.url}\n${htmlRaw}`;
           const lower = hay.toLowerCase();
 
-          // NEW: strict name-token gate — must contain the distinctive tokens from the park name
-          if (!passesNameTokenGate(hay, displayName)) {
-            continue;
-          }
+          // strict name-token gate
+          if (!passesNameTokenGate(hay, displayName)) continue;
 
-          // Region requirement (if we have one)
+          // Region requirement
           if ((requireRegion || regionTokens.length) && regionTokens.length) {
             const inUrl = regionTokens.some(t => t && (host + path).includes(t));
             const inText = regionTokens.some(t => t && lower.includes(t));
-            if (!inUrl && !inText) {
-              continue;
-            }
-            // Drop obvious wrong-state URLs
-            if (otherStateTokens.some(t => t && (host + path).includes(t))) {
-              continue;
-            }
+            if (!inUrl && !inText) continue;
+            if (otherStateTokens.some(t => t && (host + path).includes(t))) continue;
           }
 
           // Avoid unrelated NPS unit
@@ -473,7 +497,6 @@ export async function handler(event) {
             return { url: r.url, feeInfo, kind: "general" };
           }
 
-          // fallback if seems fee-ish
           if (!bestFallback && looksLikeFeePath(path)) {
             bestFallback = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
           }
