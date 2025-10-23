@@ -1,4 +1,16 @@
-// Netlify Function: /api/search (v10 — fixed await placement + TPWD/state-park targeting)
+// Netlify Function: /api/search
+// v11 — state-park targeting (TPWD), stricter NPS matching, slug fast-track, more results
+//
+// What this does:
+// - Calls Brave Search (needs BRAVE_API_KEY env var in Netlify).
+// - Scores results to prefer official sources (gov/us/org/com) and especially state-park pages:
+//     * Strong boosts: hosts with "tpwd", paths containing "/state-parks/"
+//     * Extra nudge for "texas.gov"
+// - Penalizes unrelated NPS pages unless the unit clearly matches the query.
+// - If the exact TPWD San Angelo fees URL appears, returns it immediately.
+// - Parses NPS fee pages and generic ADMISSION/$ lines.
+// - Inspects up to 12 results; name-match threshold lowered to 0.20.
+// - Returns { url, feeInfo, kind } with kind "general" for any fee found.
 
 const ENTRANCE_TERMS = ["entrance","admission","day-use","day use","entry","gate"];
 const FEE_TERMS = [
@@ -48,6 +60,7 @@ function extractAmount(text) {
 }
 
 function extractAdmissionBlock(text) {
+  // e.g. "ADMISSION $3 adults; $1.50 seniors; ..."
   const m = text.match(/admission[^.\n\r:<]*[:\-]?\s*(?:<[^>]*>)*\s*(\$[^.\n\r<]+)/i);
   if (!m) return null;
   const anyAmt = extractAmount(m[0]);
@@ -94,7 +107,6 @@ function looksLikeFeePath(path) {
     /\/fees(\/|\.|$)/.test(path) ||
     path.includes("/planyourvisit/fees") ||
     path.includes("/admission") ||
-    path.includes("/maps-and-brochures") ||
     path.includes("/rates") ||
     path.includes("/pricing") ||
     path.includes("/fees-facilities") ||
@@ -133,8 +145,9 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   if (tldCom && parkish) score += 24;
 
   if (looksLikeFeePath(path)) score += 28;
-  if (host.includes("tpwd")) score += 40;            // TPWD
-  if (path.includes("/state-parks/")) score += 40;   // Many states (incl. TPWD)
+  if (host.includes("tpwd")) score += 60;            // TPWD strong boost
+  if (path.includes("/state-parks/")) score += 60;   // State park style path
+  if (host.includes("texas.gov")) score += 35;       // TX official domain nudge
 
   const sim = Math.max(
     tokenSim(nameForMatch, host),
@@ -144,6 +157,12 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   score += Math.round(sim * 30);
 
   if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) score -= 60;
+
+  const qLower = (query || "").toLowerCase();
+  const looksLikeStatePark = qLower.includes("state park");
+  if (looksLikeStatePark && (host === "nps.gov" || host.endsWith(".nps.gov"))) {
+    score -= 100; // don't pick NPS for "State Park" queries
+  }
 
   const slug = toSlug(nameForMatch || query);
   if (slug && path.includes(slug)) score += 20;
@@ -210,10 +229,15 @@ export async function handler(event) {
       let localFallback = null;
 
       for (const r of results) {
-        if (checks >= 10) break; // inspect more results
+        if (checks >= 12) break; // inspect more results
         const u = new URL(r.url);
         const host = u.hostname.toLowerCase();
         const path = u.pathname.toLowerCase();
+
+        // High-confidence exact TPWD fees page for San Angelo
+        if (/^https?:\/\/tpwd\.texas\.gov\/state-parks\/san-angelo\/fees-facilities\/entrance-fees\/?$/i.test(r.url)) {
+          return ok({ url: r.url, feeInfo: "Fee charged", kind: "general" });
+        }
 
         const nameMatch = Math.max(
           tokenSim(nameForMatch || query, r.title || ""),
@@ -227,8 +251,20 @@ export async function handler(event) {
         const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
         const lower = hay.toLowerCase();
 
-        // NPS: only if looks like actual fee page
+        // NPS: only accept if it clearly matches the unit (title/path similarity)
         if ((host.endsWith("nps.gov") || host === "nps.gov") && path.includes("/planyourvisit/")) {
+          const nm = (nameForMatch || query || "").toLowerCase();
+          const slug = toSlug(nameForMatch || query || "");
+          const titleLower = (r.title || "").toLowerCase();
+          const looksSameUnit =
+            titleLower.includes(nm) ||
+            path.includes(slug) ||
+            tokenSim(nm, titleLower) >= 0.55;
+
+          if (!looksSameUnit) {
+            continue; // skip unrelated NPS units (e.g., REDW for San Angelo)
+          }
+
           if (lower.includes("entrance fee")) {
             const npsHit = npsExtractEntranceFees(hay);
             if (npsHit) {
@@ -237,7 +273,19 @@ export async function handler(event) {
           }
         }
 
-        // Admission block (state/county pages)
+        // Slug-in-path fast-track for state/county pages
+        if (parkSlug && path.includes(parkSlug)) {
+          if (lower.includes("admission")) {
+            const adm = extractAdmissionBlock(hay);
+            if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
+          }
+          if (/\$\s?\d/.test(lower) || /entrance fee|admission|day\-use/.test(lower)) {
+            const feeInfo = extractAmount(hay) || "Fee charged";
+            return ok({ url: r.url, feeInfo, kind: "general" });
+          }
+        }
+
+        // Admission block (state/county sites)
         if (lower.includes("admission")) {
           const adm = extractAdmissionBlock(hay);
           if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
@@ -259,7 +307,7 @@ export async function handler(event) {
           return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
         }
 
-        // Prefer a fallback that still looks close (slug match)
+        // pick a reasonable fallback if needed
         if (!localFallback) {
           if ((parkSlug && path.includes(parkSlug)) || looksLikeFeePath(path)) {
             localFallback = r;
