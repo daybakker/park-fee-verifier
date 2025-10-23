@@ -132,6 +132,10 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 80 : 10);
   if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
+  if (host === ".gov" || host.endsWith(".gov")) score += 60;
+  if (host.includes("tpwd")) score += 40;
+  if (path.includes("/state-parks/")) score += 40;
+  if (path.includes ("statepark")) score +=40;
   if (tldGov) score += 50;
 
   // Semi-official/local: park-ish keywords
@@ -224,7 +228,7 @@ export async function handler(event) {
       let checks = 0;
 
       for (const r of results) {
-        if (checks >= 4) break;
+        if (checks >= 10) break;
 
         const u = new URL(r.url);
         const host = u.hostname.toLowerCase();
@@ -235,7 +239,7 @@ export async function handler(event) {
           tokenSim(nameForMatch || query, r.title || ""),
           tokenSim(nameForMatch || query, host + path)
         );
-        if (nameMatch < 0.35) { continue; }
+        if (nameMatch < 0.20) { continue; }
 
         checks++;
         const htmlRaw = await fetchText(r.url);
