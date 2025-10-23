@@ -9,15 +9,6 @@ const ParkFeeVerifier = () => {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
-  // ---------- helpers ----------
-  const normalizeName = (name) => {
-    if (!name) return '';
-    return name.toLowerCase()
-      .replace(/[^\w\s]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  };
-
   const identifyAgency = (name) => {
     const n = (name || '').toLowerCase();
     if (n.includes('national park') || n.includes(' np')) return 'NPS';
@@ -29,9 +20,8 @@ const ParkFeeVerifier = () => {
     return 'Unknown';
   };
 
-  // ---------- REAL WEB LOOKUP (calls your Netlify Function) ----------
+  // ---- REAL WEB LOOKUP via Netlify function ----
   const verifyFee = async (parkNameOrUrl, state, managingAgency, urlFromRow) => {
-    // Derive a pretty name if an AllTrails URL was provided
     let nameForMatch = parkNameOrUrl || '';
     try {
       if (parkNameOrUrl && parkNameOrUrl.includes('alltrails.com')) {
@@ -39,35 +29,45 @@ const ParkFeeVerifier = () => {
         nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
       }
     } catch {}
+
     if (!parkNameOrUrl && urlFromRow && urlFromRow.includes('alltrails.com')) {
       const parts = urlFromRow.split('/').filter(Boolean);
       nameForMatch = decodeURIComponent(parts[parts.length - 1].replace(/-/g, ' '));
     }
 
-    const res = await fetch('/api/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query: parkNameOrUrl || urlFromRow || '',
-        state: (state || '').trim() || null,
-        nameForMatch
-      })
-    });
+    const payload = {
+      query: parkNameOrUrl || urlFromRow || '',
+      state: (state || '').trim() || null,
+      nameForMatch
+    };
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.error('Search function error:', res.status, text);
-      return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
-    }
+    const tryFetch = async (endpoint) => {
+      console.log('[fee verifier] POST', endpoint, payload);
+      const r = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const raw = await r.text();
+      console.log('[fee verifier] Response', r.status, raw);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return JSON.parse(raw || '{}');
+    };
 
-    let data = {};
-    try { data = await res.json(); } catch {
-      console.error('Search function JSON parse error');
-      data = {};
+    let data = null;
+    try {
+      data = await tryFetch('/api/search');
+    } catch {
+      try {
+        data = await tryFetch('/.netlify/functions/search');
+      } catch (e2) {
+        console.error('Search function error:', e2);
+        return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
+      }
     }
 
     const feeInfo = data.feeInfo || 'Not verified';
-    const kind = data.kind || 'not-verified';        // expected: "general" | "parking" | "no-fee" | "not-verified"
+    const kind = data.kind || 'not-verified';        // "general" | "parking" | "no-fee" | "not-verified"
     const source = data.url || '';
 
     const baseName = parkNameOrUrl || nameForMatch || 'The park';
@@ -79,18 +79,15 @@ const ParkFeeVerifier = () => {
     } else if (feeInfo === 'Not verified' || !source) {
       alert = 'unverified';
     } else if (kind === 'parking') {
-      // Parking/lot fee template
       alert = `There is a fee to park at ${baseName}. For more information, please visit ${source}.`;
     } else {
-      // Generic entrance/day-use fee template
       alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
     }
 
-    // Validation: "no fee"/"unverified" are exact lowercase; others must end with one plain URL and a period
+    // Validation: "no fee"/"unverified" exact lowercase; others end with exactly one plain URL + period
     if (alert !== 'no fee' && alert !== 'unverified') {
       const urlCount = (alert.match(/https?:\/\/\S+/g) || []).length;
       if (!alert.endsWith('.') || urlCount !== 1) {
-        console.warn('Alert formatting adjusted to meet validation rules.');
         alert = `${baseName} charges a fee to enter. For more information, please visit ${source}.`;
       }
     }
@@ -98,7 +95,6 @@ const ParkFeeVerifier = () => {
     return { feeInfo, feeSource: source, alert };
   };
 
-  // ---------- single flow ----------
   const processSingle = async () => {
     if (!singleInput.trim()) return;
     setProcessing(true);
@@ -133,7 +129,6 @@ const ParkFeeVerifier = () => {
     return url;
   };
 
-  // ---------- CSV flow (auto-run on upload) ----------
   const processCSV = async (file) => {
     Papa.parse(file, {
       header: true,
@@ -199,7 +194,6 @@ const ParkFeeVerifier = () => {
     return { icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
   };
 
-  // ---------- UI ----------
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50 p-6">
       <div className="max-w-7xl mx-auto">
