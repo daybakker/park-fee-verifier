@@ -161,12 +161,29 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
   if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) score -= 60;
 
   // Extra bonus if the park slug appears in the path
-  const slug = toSlug(nameForMatch || query);
-  if (slug && path.includes(slug)) score += 20;
+ if (slug && path.includes(slug)) {
+  // try to parse immediately
+  const htmlRaw = await fetchText(r.url);
+  const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
+  const lower = hay.toLowerCase();
 
-  return score;
+  // admission block
+  if (lower.includes("admission")) {
+    const adm = extractAdmissionBlock(hay);
+    if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
+  }
+  // generic $/fee detection
+  const amounts = findDollarAmounts(hay);
+  if (amounts.length || /entrance fee|admission|day\-use|\$/.test(lower)) {
+    const feeInfo = extractAmount(hay) || "Fee charged";
+    return ok({ url: r.url, feeInfo, kind: "general" });
+  }
+  // explicit “no fee” near entrance words
+  if (/no fee|free/.test(lower) && nearEachOther(lower, ["no fee","free"], ["entrance","admission","day-use"])) {
+    return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
+  }
 }
-
+  
 function buildScope(stateCode) {
   const base = [
     "site:.gov","site:.us","site:.org","site:.com",
