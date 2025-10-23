@@ -1,28 +1,80 @@
 // Netlify Function: /api/search
-// v11 — state-park targeting (TPWD), stricter NPS matching, slug fast-track, more results
-//
-// What this does:
-// - Calls Brave Search (needs BRAVE_API_KEY env var in Netlify).
-// - Scores results to prefer official sources (gov/us/org/com) and especially state-park pages:
-//     * Strong boosts: hosts with "tpwd", paths containing "/state-parks/"
-//     * Extra nudge for "texas.gov"
-// - Penalizes unrelated NPS pages unless the unit clearly matches the query.
-// - If the exact TPWD San Angelo fees URL appears, returns it immediately.
-// - Parses NPS fee pages and generic ADMISSION/$ lines.
-// - Inspects up to 12 results; name-match threshold lowered to 0.20.
-// - Returns { url, feeInfo, kind } with kind "general" for any fee found.
+// v20 — International: multilingual fee terms, global gov patterns, ccTLD boosts, slug match, stricter NPS matching.
+// Requires: BRAVE_API_KEY set in Netlify environment vars.
 
-const ENTRANCE_TERMS = ["entrance","admission","day-use","day use","entry","gate"];
+/////////////////////////////
+// Language-aware constants
+/////////////////////////////
+
+// Entrance/admission keywords in several languages (lowercase; keep short & unambiguous)
+const ENTRANCE_TERMS = [
+  // EN
+  "entrance", "entry", "admission", "day-use", "day use", "access",
+  // ES
+  "entrada", "ingreso", "acceso",
+  // FR
+  "entrée", "entree", "accès", "acces",
+  // DE
+  "eintritt", "zugang",
+  // IT
+  "ingresso", "accesso", "biglietto",
+  // PT
+  "entrada", "acesso",
+  // NL/Scandinavian
+  "toegang", "adgang", "inträde", "inngang",
+  // TR
+  "giriş", "girış",
+  // JA
+  "入場", "入園", "料金",
+  // ZH
+  "门票", "門票", "票價", "票价", "收费", "收費",
+  // KO
+  "입장료", "요금",
+];
+
+// Generic fee/pay words (to pair with a currency or digits)
 const FEE_TERMS = [
-  "entrance fee","entrance fees","admission","admission fee","admission rates",
-  "parking fee","day-use","day use","entrance pass","amenity fee","$"
-];
-const NO_FEE_TERMS = [
-  "no fee","free entry","free admission","no entrance fee","free to enter",
-  "no day-use fee","no fees","no charge"
+  // EN
+  "fee", "fees", "price", "prices", "rate", "rates", "pass",
+  "parking fee", "amenity fee", "day-use",
+  // ES
+  "tarifa", "tarifas", "precio", "precios", "pase",
+  // FR
+  "tarif", "tarifs", "prix", "pass",
+  // DE
+  "gebühr", "gebuehr", "gebühren", "preise",
+  // IT
+  "tariffa", "tariffe", "prezzo", "prezzi", "pass",
+  // PT
+  "taxa", "taxas", "preço", "preços", "passe",
+  // Others short
+  "料金", "요금", "收费", "收費", "цена", "цены"
 ];
 
-// ---------- utils ----------
+// Negative “no fee” patterns
+const NO_FEE_TERMS = [
+  "no fee", "free", "free entry", "free admission", "no entrance fee", "no charge",
+  // ES
+  "gratis", "sin costo", "sin cargo",
+  // FR
+  "gratuit",
+  // DE
+  "kostenlos",
+  // IT
+  "gratuito",
+  // PT
+  "gratuito", "grátis", "sem custo",
+  // ZH/JA/KO
+  "免费", "免費", "무료", "無料"
+];
+
+// Currency symbols/patterns (many)
+const CURRENCY_RX = /(\$|€|£|¥|₹|₩|₺|₽|₴|R\$|C\$|A\$|NZ\$|CHF|SEK|NOK|DKK|zł|Kč|Ft|₫|R|AED|SAR|₱|MXN|COP|PEN|S\/|CLP|ARS)\s?\d{1,3}([.,]\d{2})?/i;
+
+/////////////////////////////
+// Helpers
+/////////////////////////////
+
 function toSlug(s = "") {
   return s
     .toLowerCase()
@@ -43,52 +95,16 @@ async function fetchText(url) {
   try {
     const r = await fetch(url, { redirect: "follow" });
     if (!r.ok) return "";
-    return (await r.text()).slice(0, 800000);
+    return (await r.text()).slice(0, 900000); // cap
   } catch { return ""; }
 }
 
-function findDollarAmounts(text) {
-  return [...text.matchAll(/\$\s?(\d{1,3})(\.\d{2})?/g)].map(m => m[0].replace(/\s+/g,""));
+function hasAny(hay, arr) {
+  const t = hay.toLowerCase();
+  return arr.some(k => t.includes(k));
 }
 
-function extractAmount(text) {
-  const m = text.match(/\$\s?(\d{1,3})(\.\d{2})?\s*(per\s*(vehicle|car|person|adult|child|motorcycle|bike))?/i);
-  if (!m) return null;
-  const dollars = `$${m[1]}${m[2] ?? ""}`;
-  const suffix = m[3] ? ` ${m[3]}` : "";
-  return `${dollars}${suffix}`.trim();
-}
-
-function extractAdmissionBlock(text) {
-  // e.g. "ADMISSION $3 adults; $1.50 seniors; ..."
-  const m = text.match(/admission[^.\n\r:<]*[:\-]?\s*(?:<[^>]*>)*\s*(\$[^.\n\r<]+)/i);
-  if (!m) return null;
-  const anyAmt = extractAmount(m[0]);
-  return anyAmt || "Fee charged";
-}
-
-function extractLabelAmount(text, labelRegexes) {
-  for (const rx of labelRegexes) {
-    const r1 = new RegExp(`${rx.source}\\s*[:\\-–]?\\s*\\$\\s?(\\d{1,3})(\\.\\d{2})?`, "i");
-    const m1 = text.match(r1);
-    if (m1) return `$${m1[1]}${m1[2] ?? ""}`;
-  }
-  const m2 = text.match(/\$\s?(\d{1,3})(\.\d{2})?\s*per\s*(vehicle|car|person|adult|child)/i);
-  if (m2) return `$${m2[1]}${m2[2] ?? ""} per ${m2[3]}`;
-  return null;
-}
-
-function npsExtractEntranceFees(text) {
-  const vehicle = extractLabelAmount(text, [/private\s+vehicle/, /vehicle/]);
-  const moto    = extractLabelAmount(text, [/motorcycle/]);
-  const person  = extractLabelAmount(text, [/per\s+person/, /individual/]);
-  if (vehicle) return { feeInfo: vehicle.includes("per") ? vehicle : `${vehicle} per vehicle` };
-  if (moto)    return { feeInfo: moto.includes("per") ? moto : `${moto} per vehicle` };
-  if (person)  return { feeInfo: person.includes("per") ? person : `${person} per person` };
-  return null;
-}
-
-function nearEachOther(text, wordsA, wordsB, maxGap = 160) {
+function nearEachOther(text, wordsA, wordsB, maxGap = 200) {
   const t = text.toLowerCase();
   for (const a of wordsA) {
     const ia = t.indexOf(a);
@@ -102,15 +118,16 @@ function nearEachOther(text, wordsA, wordsB, maxGap = 160) {
   return false;
 }
 
+function extractAmount(text) {
+  const m = text.match(CURRENCY_RX);
+  return m ? m[0].replace(/\s+/g," ") : null;
+}
+
 function looksLikeFeePath(path) {
   return (
-    /\/fees(\/|\.|$)/.test(path) ||
-    path.includes("/planyourvisit/fees") ||
-    path.includes("/admission") ||
-    path.includes("/rates") ||
-    path.includes("/pricing") ||
-    path.includes("/fees-facilities") ||
-    path.includes("/state-parks/")
+    /\/fees?(\/|\.|$)/i.test(path) ||
+    /\/(planyourvisit|visit|prices|pricing|tarif|tarifa|preise|料金|요금|收费)/i.test(path) ||
+    /\/(admission|entrada|entree|eingang|ingresso|entrada)/i.test(path)
   );
 }
 
@@ -119,8 +136,21 @@ function detectNpsIntent(q) {
   return /\bnps\b|national park|national monument|national recreation area|national preserve/.test(s);
 }
 
-// Domain scoring (hints for state/county park pages, penalize unrelated NPS)
-function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
+// Accept only if NPS unit matches query
+function isSameNpsUnit(r, query) {
+  const nm = (query || "").toLowerCase();
+  const slug = toSlug(query || "");
+  const titleLower = (r.title || "").toLowerCase();
+  const urlLower = (r.url || "").toLowerCase();
+  return (
+    titleLower.includes(nm) ||
+    urlLower.includes(slug) ||
+    tokenSim(nm, titleLower) >= 0.55
+  );
+}
+
+// Domain scoring: global “official-ish” boosts
+function scoreHost(url, displayName = "", query = "", npsIntent = false) {
   let score = 0;
   let host = "", path = "";
   try {
@@ -129,55 +159,64 @@ function scoreHost(url, nameForMatch = "", query = "", npsIntent = false) {
     path = u.pathname.toLowerCase();
   } catch { return -1; }
 
-  const tldGov = host.endsWith(".gov");
-  const tldUs  = host.endsWith(".us");
-  const tldOrg = host.endsWith(".org");
-  const tldCom = host.endsWith(".com");
+  // Global government patterns
+  const isGov =
+    /\.gov(\.[a-z]{2})?$/.test(host) ||
+    /\.govt\.[a-z]{2}$/.test(host) ||
+    /\.gouv\.[a-z]{2}$/.test(host) ||
+    /\.gob\.[a-z]{2}$/.test(host) ||
+    /\.go\.[a-z]{2}$/.test(host) ||
+    /\.municipio\.[a-z]{2}$/.test(host) ||
+    /\.kommune\.[a-z]{2}$/.test(host);
 
+  if (isGov) score += 80;
+
+  // US federal agencies
   if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 80 : 10);
   if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
-  if (tldGov) score += 50;
 
-  const parkish = /stateparks|parks|parkandrec|recreation|recdept|dnr|naturalresources|county|city|tpwd|parksandwildlife/.test(host);
-  if (tldUs)  score += 30;
-  if (tldOrg && parkish) score += 26;
-  if (tldCom && parkish) score += 24;
+  // Park-related hosts across TLDs
+  const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|natur|nature|reserva|reserve|parc|parque|parchi|parqueadero|gemeente|municipality|municipio|ayuntamiento|city|county)/.test(host);
+  if (parkish) score += 28;
 
-  if (looksLikeFeePath(path)) score += 28;
-  if (host.includes("tpwd")) score += 60;            // TPWD strong boost
-  if (path.includes("/state-parks/")) score += 60;   // State park style path
-  if (host.includes("texas.gov")) score += 35;       // TX official domain nudge
+  // Fee-y paths
+  if (looksLikeFeePath(path)) score += 30;
 
+  // Similarity to query
   const sim = Math.max(
-    tokenSim(nameForMatch, host),
-    tokenSim(nameForMatch, path),
-    tokenSim(nameForMatch, query)
+    tokenSim(displayName, host),
+    tokenSim(displayName, path),
+    tokenSim(displayName, query)
   );
   score += Math.round(sim * 30);
 
-  if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) score -= 60;
-
+  // Penalize NPS when query looks like “State Park” etc.
   const qLower = (query || "").toLowerCase();
-  const looksLikeStatePark = qLower.includes("state park");
-  if (looksLikeStatePark && (host === "nps.gov" || host.endsWith(".nps.gov"))) {
-    score -= 100; // don't pick NPS for "State Park" queries
+  const looksStateOrRegional = /state park|provincial park|regional park|city park|county park|parque estatal|parc national|parco/.test(qLower);
+  if (!npsIntent && (host === "nps.gov" || host.endsWith(".nps.gov"))) {
+    score -= 40;
+    if (looksStateOrRegional) score -= 60;
   }
 
-  const slug = toSlug(nameForMatch || query);
-  if (slug && path.includes(slug)) score += 20;
+  // Slug signal
+  const slug = toSlug(displayName || query);
+  if (slug && path.includes(slug)) score += 25;
 
   return score;
 }
 
-function buildScope(stateCode) {
+function buildScope(countryOrStateCode) {
+  // Don’t over-restrict: we’ll use scoring; scope just hints.
   const base = [
-    "site:.gov","site:.us","site:.org","site:.com",
-    "site:nps.gov","site:fs.usda.gov","site:blm.gov"
+    "site:.gov", "site:.gov.*", "site:.govt.*", "site:.gouv.*", "site:.go.*", "site:.gob.*",
+    "site:.us", "site:.uk", "site:.au", "site:.ca", "site:.nz", "site:.eu",
+    "site:.org", "site:.com",
+    "site:nps.gov", "site:fs.usda.gov", "site:blm.gov"
   ];
-  if (stateCode) {
-    const st = stateCode.toLowerCase();
-    base.push(`site:${st}.gov`, `site:${st}.us`, `site:parks.${st}.gov`, `site:stateparks.${st}.gov`);
+  if (countryOrStateCode) {
+    const st = countryOrStateCode.toLowerCase();
+    base.push(`site:.${st}`);
   }
   return "(" + base.join(" OR ") + ")";
 }
@@ -186,11 +225,12 @@ function ok(payload) {
   return { statusCode: 200, headers: { "Content-Type":"application/json" }, body: JSON.stringify(payload) };
 }
 
-// ---------- main ----------
+/////////////////////////////
+// Main handler
+/////////////////////////////
+
 export async function handler(event) {
-  if (event.httpMethod !== "POST") {
-    return ok({ error: "POST only" });
-  }
+  if (event.httpMethod !== "POST") return ok({ error: "POST only" });
 
   const key = process.env.BRAVE_API_KEY;
   if (!key) return ok({ error: "Missing BRAVE_API_KEY" });
@@ -200,118 +240,83 @@ export async function handler(event) {
   const { query, state = null, nameForMatch = null } = body;
   if (!query) return ok({ error: "Missing query" });
 
-  const scope = buildScope(state);
-  const baseQ = `${query} ${scope} (admission OR "entrance fee" OR "$" OR "day-use" OR "parking fee")`;
-  const queries = [
-    baseQ,
-    `${query} ${scope} ("/state-parks/" OR "/fees-facilities/" OR "/fees")`
-  ];
-
+  const displayName = nameForMatch || query;
   const npsIntent = detectNpsIntent(query);
-  const parkSlug = toSlug(nameForMatch || query);
+  const scope = buildScope(state);
+
+  // Broad, multilingual query variants
+  const queries = [
+    `${query} ${scope} (admission OR "entrance fee" OR entrada OR entrée OR eintritt OR ingresso OR tarifa OR tarif OR gebühr OR precio OR prix OR 料金 OR 요금 OR 收费 OR "$")`,
+    `${query} ${scope} (fees OR prices OR rates OR pricing OR tarifas OR tarifs OR preise OR prezzi OR precios OR 料金 OR 요금 OR 收费)`,
+    `${query} ${scope} (parking fee OR "day-use" OR "day use" OR estacionamiento OR aparcamiento OR estacionamiento pago OR "parcheggio" OR "料金" OR "요금")`
+  ];
 
   try {
     let bestFallback = null;
 
     for (const q of queries) {
-      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=12&country=US&search_lang=en`;
+      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=15&country=US&search_lang=en`;
       const sr = await fetch(url, { headers: { "X-Subscription-Token": key, "Accept": "application/json" }});
       if (!sr.ok) continue;
       const data = await sr.json();
       let results = (data.web?.results || []).filter(r => r.url);
 
+      // Rank by global “official-ish” score
       results.sort((a, b) =>
-        scoreHost(b.url, nameForMatch || query, query, npsIntent) -
-        scoreHost(a.url, nameForMatch || query, query, npsIntent)
+        scoreHost(b.url, displayName, query, npsIntent) -
+        scoreHost(a.url, displayName, query, npsIntent)
       );
 
       let checks = 0;
       let localFallback = null;
 
       for (const r of results) {
-        if (checks >= 12) break; // inspect more results
+        if (checks >= 15) break;
         const u = new URL(r.url);
         const host = u.hostname.toLowerCase();
         const path = u.pathname.toLowerCase();
 
-        // High-confidence exact TPWD fees page for San Angelo
-        if (/^https?:\/\/tpwd\.texas\.gov\/state-parks\/san-angelo\/fees-facilities\/entrance-fees\/?$/i.test(r.url)) {
-          return ok({ url: r.url, feeInfo: "Fee charged", kind: "general" });
-        }
-
+        // Require the result to look related by title or URL tokens
         const nameMatch = Math.max(
-          tokenSim(nameForMatch || query, r.title || ""),
-          tokenSim(nameForMatch || query, host + path)
+          tokenSim(displayName, r.title || ""),
+          tokenSim(displayName, host + path)
         );
-        if (nameMatch < 0.20) { continue; } // more lenient
-
+        if (nameMatch < 0.20) continue;
         checks++;
 
         const htmlRaw = await fetchText(r.url);
         const hay = `${r.title || ""}\n${r.snippet || ""}\n${htmlRaw}`;
         const lower = hay.toLowerCase();
 
-        // NPS: only accept if it clearly matches the unit (title/path similarity)
+        // Don’t accept unrelated NPS units
         if ((host.endsWith("nps.gov") || host === "nps.gov") && path.includes("/planyourvisit/")) {
-          const nm = (nameForMatch || query || "").toLowerCase();
-          const slug = toSlug(nameForMatch || query || "");
-          const titleLower = (r.title || "").toLowerCase();
-          const looksSameUnit =
-            titleLower.includes(nm) ||
-            path.includes(slug) ||
-            tokenSim(nm, titleLower) >= 0.55;
-
-          if (!looksSameUnit) {
-            continue; // skip unrelated NPS units (e.g., REDW for San Angelo)
-          }
-
-          if (lower.includes("entrance fee")) {
-            const npsHit = npsExtractEntranceFees(hay);
-            if (npsHit) {
-              return ok({ url: r.url, feeInfo: npsHit.feeInfo, kind: "general" });
-            }
+          if (!isSameNpsUnit(r, displayName)) {
+            continue;
           }
         }
 
-        // Slug-in-path fast-track for state/county pages
-        if (parkSlug && path.includes(parkSlug)) {
-          if (lower.includes("admission")) {
-            const adm = extractAdmissionBlock(hay);
-            if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
-          }
-          if (/\$\s?\d/.test(lower) || /entrance fee|admission|day\-use/.test(lower)) {
-            const feeInfo = extractAmount(hay) || "Fee charged";
-            return ok({ url: r.url, feeInfo, kind: "general" });
-          }
-        }
+        // Strong signals:
+        const hasCurrency = CURRENCY_RX.test(hay);
+        const hasEntrance = hasAny(lower, ENTRANCE_TERMS);
+        const hasFeeWord  = hasAny(lower, FEE_TERMS);
+        const hasNoFee    = hasAny(lower, NO_FEE_TERMS);
 
-        // Admission block (state/county sites)
-        if (lower.includes("admission")) {
-          const adm = extractAdmissionBlock(hay);
-          if (adm) return ok({ url: r.url, feeInfo: adm, kind: "general" });
-        }
-
-        // Generic $/fee detection
-        const amounts = findDollarAmounts(hay);
-        const hasFeeTerms = FEE_TERMS.some(k => lower.includes(k));
-        const hasNoFeeTerms = NO_FEE_TERMS.some(k => lower.includes(k));
-        const hasEntranceContextNoFee = hasNoFeeTerms && nearEachOther(lower, NO_FEE_TERMS, ENTRANCE_TERMS, 160);
-
-        if (amounts.length || hasFeeTerms) {
-          const labeled = npsExtractEntranceFees(hay);
-          const feeInfo = labeled?.feeInfo || extractAmount(hay) || "Fee charged";
-          return ok({ url: r.url, feeInfo, kind: "general" });
-        }
-
-        if (!amounts.length && hasEntranceContextNoFee) {
+        // Accept: explicit “no fee” near entrance/admission words
+        if (!hasCurrency && hasNoFee && nearEachOther(lower, NO_FEE_TERMS, ENTRANCE_TERMS, 220)) {
           return ok({ url: r.url, feeInfo: "No fee", kind: "no-fee" });
         }
 
-        // pick a reasonable fallback if needed
-        if (!localFallback) {
-          if ((parkSlug && path.includes(parkSlug)) || looksLikeFeePath(path)) {
-            localFallback = r;
-          }
+        // Accept: fees present (currency + entrance/fee words)
+        if ((hasCurrency && (hasEntrance || hasFeeWord)) || (hasFeeWord && looksLikeFeePath(path))) {
+          const amt = extractAmount(hay);
+          const feeInfo = amt ? (amt.includes("per") ? amt : amt) : "Fee charged";
+          return ok({ url: r.url, feeInfo, kind: "general" });
+        }
+
+        // Prefer a decent fallback (slug in path or fee-looking path)
+        const slug = toSlug(displayName);
+        if (!localFallback && (looksLikeFeePath(path) || (slug && path.includes(slug)))) {
+          localFallback = r;
         }
       }
 
