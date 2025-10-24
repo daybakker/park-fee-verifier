@@ -1,5 +1,5 @@
 // Netlify Function: /api/search
-// v25 — Strong name-token filtering + region inference + AllTrails support
+// v25+p — tiny patches to improve recall without breaking v25 behavior
 // Env var required: BRAVE_API_KEY
 
 /////////////////////////////
@@ -20,7 +20,7 @@ const ENTRANCE_TERMS = [
 ];
 
 const FEE_TERMS = [
-  "fee","fees","price","prices","rate","rates","pricing","pass","parking fee","day-use",
+  "fee","fees","required","charge","charges","price","prices","rate","rates","pricing","pass","parking fee","day-use",
   "tarifa","tarifas","precio","precios","pase",
   "tarif","tarifs","prix","pass",
   "gebühr","gebuehr","gebühren","preise",
@@ -76,7 +76,8 @@ function tokenSim(a, b) {
   const A = new Set(norm(a).split(" ").filter(Boolean));
   const B = new Set(norm(b).split(" ").filter(Boolean));
   const inter = [...A].filter(x => B.has(x)).length;
-  return (2 * inter) / Math.max(1, A.size + B.size);
+  const denom = Math.max(1, A.size + B.size - inter);
+  return inter / denom;
 }
 
 async function fetchText(url) {
@@ -117,6 +118,11 @@ function looksLikeFeePath(path) {
     /\/(planyourvisit|visit|prices|pricing|tarif|tarifa|preise|料金|요금|收费)/i.test(path) ||
     /\/(admission|entrada|entree|eingang|ingresso)/i.test(path)
   );
+}
+
+function looksLikeHomepagePlanVisit(path) {
+  // *** PATCH: also treat plan/visit pages as good fallbacks
+  return /\/(plan|visit|plan-your-visit|visitor|about|park|explore)(\/|$)/i.test(path);
 }
 
 function detectNpsIntent(q) {
@@ -205,10 +211,12 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
   if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
 
-  const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|natur|nature|reserva|reserve|parc|parque|parchi|municipality|municipio|ayuntamiento|city|county|regionalpark|provincialpark)/.test(host);
-  if (parkish) score += 28;
+  // park-ish/official operator bump (***PATCH: add botanicalgarden/conservancy/trust/preserve)
+  const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|natur|nature|reserva|reserve|parc|parque|parchi|municipality|municipio|ayuntamiento|city|county|regionalpark|provincialpark|botanicalgarden|conservancy|trust|preserve)/.test(host);
+  if (parkish) score += 32;
 
   if (looksLikeFeePath(path)) score += 30;
+  if (looksLikeHomepagePlanVisit(path)) score += 10; // ***PATCH: prefer plan/visit as fallback
 
   // Region boost / wrong-state penalty
   const joined = host + " " + path;
@@ -230,11 +238,11 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
 }
 
 /////////////////////////////
-// Name-token gating (NEW)
+// Name-token gating (PATCH)
 /////////////////////////////
 const GENERIC_NAME_WORDS = new Set([
   "the","a","an","of","and","or","at","on","in","to","for","by",
-  "park","parks","state","national","provincial","regional","county","city","trail","area","forest","recreation","recreational","natural","nature","reserve","preserve","site"
+  "park","parks","state","national","provincial","regional","county","city","trail","area","forest","recreation","recreational","natural","nature","reserve","preserve","site","garden","botanical","botanicalgarden","shaw","village" // a few generic-ish words
 ]);
 
 function coreNameTokens(name) {
@@ -245,16 +253,20 @@ function coreNameTokens(name) {
     .filter(t => t && !GENERIC_NAME_WORDS.has(t) && t.length >= 3);
 }
 
-// Must contain enough distinctive tokens from the display name
-function passesNameTokenGate(haystack, displayName) {
+// *** PATCH: 2-token gate or strong similarity pass
+function passesNameTokenGate(haystack, displayName, strongSimBoost = 0.50) {
   const text = haystack.toLowerCase();
   const tokens = coreNameTokens(displayName);
-  if (tokens.length === 0) return true; // nothing distinctive to check
-  // Require at least min(3, tokens.length) tokens present
-  const need = Math.min(3, tokens.length);
+  if (tokens.length === 0) return true;
+
+  const need = Math.min(2, tokens.length); // was 3 in v25
   let hit = 0;
   for (const t of tokens) if (text.includes(t)) hit++;
-  return hit >= need;
+  if (hit >= need) return true;
+
+  // if overall similarity is high, allow through
+  const simTitle = tokenSim(displayName, haystack.slice(0, 600)); // title/desc first chunk
+  return simTitle >= strongSimBoost;
 }
 
 /////////////////////////////
@@ -379,7 +391,8 @@ export async function handler(event) {
 
   try {
     const seenTop = [];
-    let bestFallback = null;
+    let bestFallback = null;      // fee-like path fallback
+    let bestHomepage = null;      // ***PATCH: plan/visit homepage fallback
     let inferredState = null;
 
     const tryBatch = async (queries, requireRegion = false) => {
@@ -430,8 +443,8 @@ export async function handler(event) {
           const hay = `${r.title || ""}\n${r.description || ""}\n${r.url}\n${htmlRaw}`;
           const lower = hay.toLowerCase();
 
-          // NEW: strict name-token gate — must contain the distinctive tokens from the park name
-          if (!passesNameTokenGate(hay, displayName)) {
+          // ***PATCH: looser name-token gate (2 tokens OR strong similarity)
+          if (!passesNameTokenGate(hay, displayName, 0.50)) {
             continue;
           }
 
@@ -463,19 +476,44 @@ export async function handler(event) {
           const hasFeeWord  = hasAny(lower, FEE_TERMS);
           const hasNoFee    = hasAny(lower, NO_FEE_TERMS);
 
+          // ***PATCH: consider (entrance/admission/day-use) near (fee/fees/required/charge) as general fee even w/o currency
+          const entranceNearFee = nearEachOther(lower, ENTRANCE_TERMS, ["fee","fees","required","charge"], 260);
+
+          // ***PATCH: specific trust for USFS/BLM text-only mentions
+          const isUSFSorBLM = (host.endsWith("fs.usda.gov") || host.endsWith(".fs.usda.gov") || host === "fs.usda.gov" || host.endsWith("blm.gov") || host === "blm.gov");
+          const usfsBlmTextFee = isUSFSorBLM && /day[- ]?use fee|recreation fee|fee required/i.test(lower);
+
+          // explicit "no fee" near entrance/admission words
           if (!hasCurrency && hasNoFee && nearEachOther(lower, NO_FEE_TERMS, ENTRANCE_TERMS, 240)) {
             return { url: r.url, feeInfo: "No fee", kind: "no-fee" };
           }
 
-          if ((hasCurrency && (hasEntrance || hasFeeWord)) || (hasFeeWord && looksLikeFeePath(path))) {
+          // general/parking fee:
+          //  - currency + (entrance/fee words)
+          //  - OR fee-like path + fee words
+          //  - OR entranceNearFee (text-only)  ***PATCH
+          //  - OR USFS/BLM text fee            ***PATCH
+          if (
+            (hasCurrency && (hasEntrance || hasFeeWord)) ||
+            (hasFeeWord && looksLikeFeePath(path)) ||
+            entranceNearFee ||
+            usfsBlmTextFee
+          ) {
             const amt = extractAmount(hay);
-            const feeInfo = amt ? amt : "Fee charged";
-            return { url: r.url, feeInfo, kind: "general" };
+            // crude parking classifier
+            if (/(parking|car park|estacionamiento|aparcamiento)/i.test(lower) && /fee|fees|rate|rates|precio|tarifa|prix|料金|요금|收费|required/i.test(lower)) {
+              return { url: r.url, feeInfo: amt || "Parking fee", kind: "parking" };
+            }
+            return { url: r.url, feeInfo: amt || "Fee charged", kind: "general" };
           }
 
-          // fallback if seems fee-ish
+          // remember potential fallbacks
           if (!bestFallback && looksLikeFeePath(path)) {
             bestFallback = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
+          }
+          // ***PATCH: remember a good homepage/plan/visit as well
+          if (!bestHomepage && looksLikeHomepagePlanVisit(path)) {
+            bestHomepage = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
           }
         }
       }
@@ -495,9 +533,11 @@ export async function handler(event) {
 
     if (found) return ok(found);
     if (bestFallback) return ok({ ...bestFallback });
+    if (bestHomepage) return ok({ ...bestHomepage }); // ***PATCH: ensure we at least return a homepage-like URL
     return ok({ url: null, feeInfo: "Not verified", kind: "not-verified" });
 
   } catch (e) {
     return ok({ error: e.message || "Error" });
   }
 }
+
