@@ -9,18 +9,11 @@ const ParkFeeVerifier = () => {
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
 
-  // ====== NEW: in-memory cache so duplicates reuse the same result ======
-  // Keyed by "<normalized name>|<normalized state>"
+  // Cache results so duplicate parks reuse the same answer
   const resultsCache = useRef(new Map());
+  const normalizeKeyPart = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const keyFor = (name) => `${normalizeKeyPart(name)}|`;
 
-  // Normalize a park/row name for consistent keys
-  const normalizeKeyPart = (s) =>
-    (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-
-  const keyFor = (name, state) =>
-    `${normalizeKeyPart(name)}|${normalizeKeyPart(state)}`;
-
-  // UI helpers (unchanged)
   const getAlertDisplay = (alert) => {
     if (alert === 'no fee') {
       return { icon: CheckCircle, color: 'text-green-600', bg: 'bg-green-50' };
@@ -31,68 +24,40 @@ const ParkFeeVerifier = () => {
     return { icon: AlertCircle, color: 'text-blue-600', bg: 'bg-blue-50' };
   };
 
-  // Build the alert text EXACTLY to spec (only 2 fee templates + 2 lower-case statuses)
   const buildAlert = (kind, displayName, url) => {
     if (kind === 'no-fee') return 'no fee';
     if (kind === 'unverified' || !url) return 'unverified';
     if (kind === 'parking') {
       return `There is a fee to park at ${displayName}. For more information, please visit ${url}.`;
     }
-    // default: general fee
     return `${displayName} charges a fee to enter. For more information, please visit ${url}.`;
   };
 
-  // Hit your Netlify function and shape the response into our three columns
-  const fetchAndShape = async ({ query, state, nameForMatch }) => {
+  const fetchAndShape = async ({ query, nameForMatch }) => {
     try {
       const res = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, state: state || null, nameForMatch }),
+        body: JSON.stringify({ query, state: null, nameForMatch }),
       });
       const data = await res.json();
-
-      // If the function returned an error, fall back to unverified
       if (!data || data.error) {
-        return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
+        return { source: '', alert: 'unverified' };
       }
-
-      // If we got a URL, translate kind to our columns
       if (data.url) {
         const kind = data.kind || 'general';
-        if (kind === 'no-fee') {
-          return { feeInfo: 'No fee', feeSource: data.url, alert: 'no fee' };
-        }
-        if (kind === 'parking') {
-          const feeInfo = data.feeInfo || 'Parking fee';
-          return {
-            feeInfo,
-            feeSource: data.url,
-            alert: buildAlert('parking', nameForMatch, data.url),
-          };
-        }
-        // general fee
-        const feeInfo = data.feeInfo || 'Fee charged';
-        return {
-          feeInfo,
-          feeSource: data.url,
-          alert: buildAlert('general', nameForMatch, data.url),
-        };
+        return { source: data.url, alert: buildAlert(kind, nameForMatch, data.url) };
       }
-
-      // data.url is null → truly unverified
-      return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
+      return { source: '', alert: 'unverified' };
     } catch {
-      return { feeInfo: 'Not verified', feeSource: '', alert: 'unverified' };
+      return { source: '', alert: 'unverified' };
     }
   };
 
-  // Extract a readable name from an AllTrails URL (client-side hint; server also handles this)
   const extractNameFromAllTrails = (input) => {
     try {
       const u = new URL(input);
       if (!u.hostname.includes('alltrails.com')) return null;
-      // Try park in path first (/park/...), else last slug from trail path
       const parts = u.pathname.split('/').filter(Boolean);
       const last = parts.at(-1);
       if (!last) return null;
@@ -102,7 +67,6 @@ const ParkFeeVerifier = () => {
     }
   };
 
-  // ====== SINGLE SEARCH ======
   const processSingle = async () => {
     const raw = (singleInput || '').trim();
     if (!raw) return;
@@ -111,33 +75,22 @@ const ParkFeeVerifier = () => {
     setProgress({ current: 0, total: 1 });
 
     try {
-      // If it’s an AllTrails URL, we still use server logic,
-      // but create a display name for alert/cache keys.
       const isAllTrails = raw.includes('alltrails.com');
       const displayName = isAllTrails ? (extractNameFromAllTrails(raw) || raw) : raw;
-      const key = keyFor(displayName, '');
+      const key = keyFor(displayName);
 
-      // 1) Use cache if we’ve already resolved this park (same state)
       let shaped = resultsCache.current.get(key);
-
-      // 2) Else call the server
       if (!shaped) {
         shaped = await fetchAndShape({
-          query: raw,            // AllTrails URL or park name
-          state: null,           // user didn’t provide state in single input
+          query: raw,
           nameForMatch: displayName,
         });
-        // 3) Cache it for duplicates later
         resultsCache.current.set(key, shaped);
       }
 
-      // 4) Show result
       setResults([{
         name: displayName,
-        state: '',
-        agency: '', // unknown at UI level
-        'Fee Info': shaped.feeInfo,
-        'Fee Source': shaped.feeSource,
+        'Fee Source': shaped.source,
         'Alert': shaped.alert,
       }]);
       setProgress({ current: 1, total: 1 });
@@ -146,7 +99,6 @@ const ParkFeeVerifier = () => {
     }
   };
 
-  // ====== CSV BATCH ======
   const processCSV = async (file) => {
     setProcessing(true);
     setResults([]);
@@ -163,51 +115,36 @@ const ParkFeeVerifier = () => {
         const out = [];
         let done = 0;
 
-        // Process rows serially to respect Netlify free plan timeouts and avoid request bursts
         for (const row of rows) {
           const parkName =
             row.name || row.trail_name || row.park || row['Park Name'] || '';
-          const state = row.state || row.State || '';
           const url = row.url || row.link || '';
 
           if (!parkName && !url) {
-            // nothing to look up; pass through
-            out.push({
-              ...row,
-              'Fee Info': 'Not verified',
-              'Fee Source': '',
-              'Alert': 'unverified',
-            });
+            out.push({ ...row, 'Fee Source': '', 'Alert': 'unverified' });
             done += 1;
             setProgress({ current: done, total });
             continue;
           }
 
-          // Build display name for alert text & cache key
           const displayName =
             parkName || extractNameFromAllTrails(url) || url || 'Unknown';
 
-          const cacheKey = keyFor(displayName, state);
-
-          // 1) Check cache first (duplicate rows reuse the first answer)
+          const cacheKey = keyFor(displayName);
           let shaped = resultsCache.current.get(cacheKey);
 
-          // 2) If not cached, call your Netlify function
           if (!shaped) {
             shaped = await fetchAndShape({
-              query: url || parkName,   // prefer URL if provided
-              state: state || null,
+              query: url || parkName,
               nameForMatch: displayName,
             });
-            // 3) Store in cache so all subsequent duplicates get filled identically
             resultsCache.current.set(cacheKey, shaped);
           }
 
-          // 4) Append shaped result
           out.push({
             ...row,
-            'Fee Info': shaped.feeInfo,
-            'Fee Source': shaped.feeSource,
+            name: parkName || row.name || row.trail_name || row.park || row['Park Name'] || displayName,
+            'Fee Source': shaped.source,
             'Alert': shaped.alert,
           });
 
@@ -218,9 +155,7 @@ const ParkFeeVerifier = () => {
         setResults(out);
         setProcessing(false);
       },
-      error: () => {
-        setProcessing(false);
-      },
+      error: () => setProcessing(false),
     });
   };
 
@@ -230,7 +165,13 @@ const ParkFeeVerifier = () => {
   };
 
   const downloadResults = () => {
-    const csv = Papa.unparse(results);
+    // Only keep: name, Fee Source, Alert
+    const minimal = results.map(r => ({
+      name: r.name || r['Park Name'] || r.park || r.trail_name || '',
+      'Fee Source': r['Fee Source'] || '',
+      'Alert': r['Alert'] || '',
+    }));
+    const csv = Papa.unparse(minimal);
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -305,21 +246,9 @@ const ParkFeeVerifier = () => {
                 />
                 <label htmlFor="csv-upload" className="cursor-pointer flex flex-col items-center">
                   <Upload size={48} className="text-gray-400 mb-4" />
-                  <span className="text-lg font-medium text-gray-700">
-                    Upload CSV File
-                  </span>
-                  <span className="text-sm text-gray-500 mt-2">
-                    Processing starts automatically upon upload
-                  </span>
+                  <span className="text-lg font-medium text-gray-700">Upload CSV File</span>
+                  <span className="text-sm text-gray-500 mt-2">Processing starts automatically upon upload</span>
                 </label>
-              </div>
-
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                <h3 className="font-semibold text-blue-900 mb-2">Expected CSV Columns:</h3>
-                <p className="text-sm text-blue-800">
-                  Required: name/trail_name/park (at least one)<br />
-                  Optional: state, agency/managing_agency, url/link
-                </p>
               </div>
             </div>
           )}
@@ -358,37 +287,25 @@ const ParkFeeVerifier = () => {
                 <thead className="bg-gray-50 border-b-2 border-gray-200">
                   <tr>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">Park/Trail</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">State</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">Agency</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">Fee Info</th>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">Fee Source</th>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-gray-700">Alert</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200">
-                  {results.slice(0, 25).map((result, idx) => {
-                    const alertValue = result.Alert || result.alert || '';
+                  {results.slice(0, 25).map((r, idx) => {
+                    const alertValue = r['Alert'] || '';
                     const alertDisplay = getAlertDisplay(alertValue);
                     const AlertIcon = alertDisplay.icon;
 
                     return (
                       <tr key={idx} className="hover:bg-gray-50">
                         <td className="px-4 py-3 text-sm text-gray-900">
-                          {result.name || result.trail_name || result.park || result['Park Name'] || '-'}
-                        </td>
-                        <td className="px-4 py-3 text-sm text-gray-600">
-                          {result.state || result.State || '-'}
-                        </td>
-                        <td className="px-4 py-3 text-sm text-gray-600">
-                          {result.agency || result.managing_agency || '-'}
-                        </td>
-                        <td className="px-4 py-3 text-sm text-gray-900 font-medium">
-                          {result['Fee Info'] || result.feeInfo || '-'}
+                          {r.name || r['Park Name'] || r.park || r.trail_name || '-'}
                         </td>
                         <td className="px-4 py-3 text-sm">
-                          {(result['Fee Source'] || result.feeSource) ? (
+                          {r['Fee Source'] ? (
                             <a
-                              href={result['Fee Source'] || result.feeSource}
+                              href={r['Fee Source']}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="text-blue-600 hover:underline"
