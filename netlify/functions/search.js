@@ -93,7 +93,7 @@ function hasAny(hay, arr) {
   return arr.some(k => t && t.includes(k));
 }
 
-const TEXT_NEAR_GAP = 320; // PATCH: wider gap to catch separated headings/tables
+const TEXT_NEAR_GAP = 500; // PATCH: wider gap to catch separated headings/tables
 
 function nearEachOther(text, groupA, groupB, maxGap = TEXT_NEAR_GAP) {
   const t = text.toLowerCase();
@@ -348,12 +348,21 @@ function buildQueries(displayName, region) {
   const core = `(admission OR "entrance fee" OR "day use" OR day-use OR fee OR fees OR prices OR rates OR pricing OR tarifa OR tarifs OR preise OR prezzi OR precios OR 料金 OR 요금 OR 收费 OR "$")`;
   const withRegion = region ? ` "${region}"` : "";
   return [
-    `"${displayName}"${withRegion} ${core}`,
-    `${displayName}${withRegion} ${core}`,
-    `"${displayName}"${withRegion} (site:.gov OR site:.gov.* OR site:.govt.* OR site:.gouv.* OR site:.go.* OR site:.gob.*) ${core}`,
-    `"${displayName}"${withRegion} (site:.org OR site:.com) (park OR parks OR "national park" OR "state park" OR parc OR parque OR reserve) ${core}`
-  ];
-}
+  `"${displayName}"${withRegion} ${core}`,
+  `${displayName}${withRegion} ${core}`,
+
+  // .gov focus
+  `"${displayName}"${withRegion} (site:.gov OR site:.gov.* OR site:.govt.* OR site:.gouv.* OR site:.go.* OR site:.gob.*) ${core}`,
+
+  // state park systems and operator-ish hosts
+  `"${displayName}"${withRegion} (site:*.stateparks.* OR site:*.parks.state.* OR site:*parks.*.gov OR site:parks.ca.gov OR site:tpwd.texas.gov OR site:lastateparks.com OR site:floridastateparks.org OR site:ncparks.gov) ${core}`,
+
+  // legit .org/.com operators (botanical garden, preserve, conservancy, trust, etc.)
+  `"${displayName}"${withRegion} (site:.org OR site:.com) (park OR parks OR preserve OR conservancy OR trust OR botanical OR garden) ${core}`,
+
+  // phrase variant helps some CMS pages
+  `"${displayName}"${withRegion} ("entrance fees" OR "admission prices" OR "day-use fee")`
+];
 
 function ok(payload) {
   return { statusCode: 200, headers: { "Content-Type":"application/json" }, body: JSON.stringify(payload) };
@@ -435,7 +444,7 @@ export async function handler(event) {
         // scan pages
         let checks = 0;
         for (const r of results) {
-          if (checks >= 35) break; // PATCH: scan more candidates per query
+          if (checks >= 50) break; // PATCH: scan more candidates per query
           let u; try { u = new URL(r.url); } catch { continue; }
           const host = u.hostname.toLowerCase();
           const path = u.pathname.toLowerCase();
@@ -554,9 +563,9 @@ export async function handler(event) {
     if (found) return ok(found);
     if (bestFallback) return ok({ ...bestFallback });
     if (bestHomepage) return ok({ ...bestHomepage });
-    if (bestRoot) return ok({ ...bestRoot }); // PATCH: ensure at least an official-ish URL
+    if (bestRoot) return ok({ ...bestRoot });   // <- keep this
     return ok({ url: null, feeInfo: "Not verified", kind: "not-verified" });
-
+    
   } catch (e) {
     return ok({ error: e.message || "Error" });
   }
