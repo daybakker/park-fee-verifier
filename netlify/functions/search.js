@@ -1,10 +1,7 @@
 // Netlify Function: /api/search
-// v25+p2 — bundled tiny patches to improve recall without breaking v25 behavior
+// v25+patch — Better official domain preference, brand boosts, parking vs general fix
 // Env var required: BRAVE_API_KEY
 
-/////////////////////////////
-// Multilingual fee signals
-/////////////////////////////
 const ENTRANCE_TERMS = [
   "entrance","entry","admission","day-use","day use","access",
   "entrada","ingreso","acceso",
@@ -20,7 +17,7 @@ const ENTRANCE_TERMS = [
 ];
 
 const FEE_TERMS = [
-  "fee","fees","required","charge","charges","price","prices","rate","rates","pricing","pass","parking fee","day-use",
+  "fee","fees","price","prices","rate","rates","pricing","pass","parking fee","day-use",
   "tarifa","tarifas","precio","precios","pase",
   "tarif","tarifs","prix","pass",
   "gebühr","gebuehr","gebühren","preise",
@@ -38,12 +35,14 @@ const NO_FEE_TERMS = [
   "免费","免費","無料","무료"
 ];
 
-// Broad currency detector
 const CURRENCY_RX = /(\$|€|£|¥|₹|₩|₺|₽|₴|R\$|C\$|A\$|NZ\$|CHF|SEK|NOK|DKK|zł|Kč|Ft|₫|R|AED|SAR|₱|MXN|COP|PEN|S\/|CLP|ARS)\s?\d{1,3}(?:[.,]\d{2})?/i;
 
-/////////////////////////////
-// US state metadata
-/////////////////////////////
+// Domains we consider “more official” globally
+const OFFICIAL_HINTS = /(stateparks|state-?parks|parks\.state|park\.state|tpwd|gastateparks|floridastateparks|azstateparks|parks\.wa\.gov|parks\.ny\.gov|parks\.ca\.gov|dcr\.virginia|dnr|dep\.state|nps\.gov|fs\.usda\.gov|blm\.gov)/i;
+
+// Domains we generally want to avoid if a more official option exists
+const NON_OFFICIAL_PENALTIES = /(conservancy|whichmuseum|tripadvisor|viator|blogspot|wordpress|alltrails|yelp|foursquare|wikivoyage|lonelyplanet|outdoorproject|onlyinyourstate|atlasobscura|kiddle|bucketlist|roadtrippers)/i;
+
 const US_STATES = [
   ["AL","Alabama"],["AK","Alaska"],["AZ","Arizona"],["AR","Arkansas"],["CA","California"],
   ["CO","Colorado"],["CT","Connecticut"],["DE","Delaware"],["FL","Florida"],["GA","Georgia"],
@@ -57,12 +56,10 @@ const US_STATES = [
   ["VA","Virginia"],["WA","Washington"],["WV","West Virginia"],["WI","Wisconsin"],["WY","Wyoming"],
   ["DC","District of Columbia"]
 ];
+
 const STATE_NAME_TO_ABBR = Object.fromEntries(US_STATES.map(([a,n]) => [n.toLowerCase(), a]));
 const STATE_ABBR_TO_NAME = Object.fromEntries(US_STATES.map(([a,n]) => [a.toLowerCase(), n]));
 
-/////////////////////////////
-// Utility helpers
-/////////////////////////////
 function toSlug(s = "") {
   return s
     .toLowerCase()
@@ -76,8 +73,7 @@ function tokenSim(a, b) {
   const A = new Set(norm(a).split(" ").filter(Boolean));
   const B = new Set(norm(b).split(" ").filter(Boolean));
   const inter = [...A].filter(x => B.has(x)).length;
-  const denom = Math.max(1, A.size + B.size - inter);
-  return inter / denom;
+  return (2 * inter) / Math.max(1, A.size + B.size);
 }
 
 async function fetchText(url) {
@@ -89,14 +85,12 @@ async function fetchText(url) {
 }
 
 function hasAny(hay, arr) {
-  const t = hay.toLowerCase();
-  return arr.some(k => t && t.includes(k));
+  const t = (hay || "").toLowerCase();
+  return arr.some(k => t.includes(k));
 }
 
-const TEXT_NEAR_GAP = 320; // PATCH: wider gap to catch separated headings/tables
-
-function nearEachOther(text, groupA, groupB, maxGap = TEXT_NEAR_GAP) {
-  const t = text.toLowerCase();
+function nearEachOther(text, groupA, groupB, maxGap = 240) {
+  const t = (text || "").toLowerCase();
   for (const a of groupA) {
     const ia = t.indexOf(a);
     if (ia === -1) continue;
@@ -110,7 +104,7 @@ function nearEachOther(text, groupA, groupB, maxGap = TEXT_NEAR_GAP) {
 }
 
 function extractAmount(text) {
-  const m = text.match(CURRENCY_RX);
+  const m = (text || "").match(CURRENCY_RX);
   return m ? m[0].replace(/\s+/g," ") : null;
 }
 
@@ -122,9 +116,8 @@ function looksLikeFeePath(path) {
   );
 }
 
-function looksLikeHomepagePlanVisit(path) {
-  // PATCH: treat plan/visit pages as good fallbacks
-  return /\/(plan|visit|plan-your-visit|visitor|about|park|explore)(\/|$)/i.test(path);
+function looksLikeParkingPath(path) {
+  return /\/(parking|trailhead|lot|parking-fee|vehicle-fee)/i.test(path);
 }
 
 function detectNpsIntent(q) {
@@ -136,9 +129,6 @@ function isAllTrailsUrl(s) {
   try { return new URL(s).hostname.includes("alltrails.com"); } catch { return false; }
 }
 
-/////////////////////////////
-// Region parsing
-/////////////////////////////
 function normalizeRegionTokens(input) {
   if (!input) return [];
   const s = input.trim().toLowerCase();
@@ -166,7 +156,7 @@ function detectStateInString(s) {
   const low = s.toLowerCase();
   for (const [abbr, name] of US_STATES) {
     if (low.includes(name.toLowerCase()) || low.match(new RegExp(`\\b${abbr.toLowerCase()}\\b`))) {
-      return name; // canonical name
+      return name;
     }
   }
   return null;
@@ -176,7 +166,6 @@ function guessStateFromAllTrailsUrl(u) {
   try {
     const url = new URL(u);
     const parts = url.pathname.split("/").filter(Boolean);
-    // /trail/us/louisiana/slug...
     if (parts[0] === "trail" && parts[1] === "us" && parts[2]) {
       const name = parts[2].replace(/-/g, " ").toLowerCase();
       const abbr = STATE_NAME_TO_ABBR[name];
@@ -187,9 +176,31 @@ function guessStateFromAllTrailsUrl(u) {
   return null;
 }
 
-/////////////////////////////
-// “Official-ish” ranking
-/////////////////////////////
+// Distinctive tokens we require the page to contain (avoid totally off-topic hosts)
+const GENERIC_NAME_WORDS = new Set([
+  "the","a","an","of","and","or","at","on","in","to","for","by",
+  "park","parks","state","national","provincial","regional","county","city","trail","area","forest","recreation","recreational","natural","nature","reserve","preserve","site","trust","land","landtrust"
+]);
+
+function coreNameTokens(name) {
+  return (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g," ")
+    .split(/\s+/)
+    .filter(t => t && !GENERIC_NAME_WORDS.has(t) && t.length >= 3);
+}
+
+function passesNameTokenGate(haystack, displayName) {
+  const text = (haystack || "").toLowerCase();
+  const tokens = coreNameTokens(displayName);
+  if (tokens.length === 0) return true;
+  const need = Math.min(3, tokens.length);
+  let hit = 0;
+  for (const t of tokens) if (text.includes(t)) hit++;
+  return hit >= need;
+}
+
+// ---------- Ranking with stronger official bias + brand boosts ----------
 function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherStateTokens = []) {
   let score = 0;
   let host = "", path = "";
@@ -205,31 +216,33 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
     /\.gouv\.[a-z]{2}$/.test(host) ||
     /\.gob\.[a-z]{2}$/.test(host) ||
     /\.go\.[a-z]{2}$/.test(host) ||
-    /\.municipio\.[a-z]{2}$/.test(host) ||
-    /\.kommune\.[a-z]{2}$/.test(host);
+    /\.municipio\.[a-z]{2}$/.test(host);
 
   if (isGov) score += 80;
-  if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 80 : 10);
-  if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 60;
+  if (host === "nps.gov" || host.endsWith(".nps.gov")) score += (npsIntent ? 90 : 20);
+  if (host === "fs.usda.gov" || host.endsWith(".fs.usda.gov") || host.endsWith(".usda.gov")) score += 70;
   if (host === "blm.gov" || host.endsWith(".blm.gov")) score += 60;
 
-  // PATCH: add broader operator bump (state systems, gardens, conservancy, preserve, etc.)
-  const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|natur|nature|reserva|reserve|parc|parque|parchi|municipality|municipio|ayuntamiento|city|county|regionalpark|provincialpark|botanicalgarden|conservancy|trust|preserve|parks\.state\.|tpwd|ncparks|lastateparks|floridastateparks|parks\.ca\.gov)/.test(host);
-  if (parkish) score += 34;
+  // Official-ish brands (.orgs and state-park brands)
+  if (OFFICIAL_HINTS.test(host)) score += 55;
+
+  // Brand/token in hostname (e.g., lulalake.org, cloudlandcanyonStatePark host, etc.)
+  const tokens = coreNameTokens(displayName);
+  for (const t of tokens) if (t && host.includes(t)) score += 35;
+
+  // Penalize non-official aggregators
+  if (NON_OFFICIAL_PENALTIES.test(host)) score -= 60;
+
+  // Park-y hosts still get a modest bump
+  const parkish = /(stateparks|nationalpark|national-?park|parks|parkandrec|recreation|recdept|dnr|naturalresources|reserva|reserve|parc|parque|municipality|municipio|ayuntamiento|city|county|regionalpark|provincialpark|landtrust|land-trust)/.test(host);
+  if (parkish) score += 20;
 
   if (looksLikeFeePath(path)) score += 30;
-  if (looksLikeHomepagePlanVisit(path)) score += 10; // prefer plan/visit as fallback
 
-  // Region boost / wrong-state penalty (PATCH: only penalize on word/segment boundary)
-  const hp = (host + path).toLowerCase();
-  for (const t of regionTokens) if (t && hp.includes(t)) score += 24;
-
-  const wrongStateHit = otherStateTokens.some(t => {
-    if (!t) return false;
-    const re = new RegExp(`(^|[\\W_/\\-])${t}([\\W_/\\-]|$)`, 'i');
-    return re.test(hp);
-  });
-  if (wrongStateHit) score -= 40;
+  // Region boost / wrong-state penalty
+  const joined = host + " " + path;
+  for (const t of regionTokens) if (t && joined.includes(t)) score += 24;
+  for (const t of otherStateTokens) if (t && joined.includes(t)) score -= 40;
 
   // Name similarity
   const sim = Math.max(
@@ -245,48 +258,13 @@ function scoreHost(url, displayName, query, npsIntent, regionTokens = [], otherS
   return score;
 }
 
-/////////////////////////////
-// Name-token gating (PATCH)
-/////////////////////////////
-const GENERIC_NAME_WORDS = new Set([
-  "the","a","an","of","and","or","at","on","in","to","for","by",
-  "park","parks","state","national","provincial","regional","county","city","trail","area","forest","recreation","recreational","natural","nature","reserve","preserve","site","garden","botanical","botanicalgarden","village","shaw"
-]);
-
-function coreNameTokens(name) {
-  return (name || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g," ")
-    .split(/\s+/)
-    .filter(t => t && !GENERIC_NAME_WORDS.has(t) && t.length >= 3);
-}
-
-// PATCH: 2-token gate or strong similarity pass
-function passesNameTokenGate(haystack, displayName, strongSimBoost = 0.50) {
-  const text = haystack.toLowerCase();
-  const tokens = coreNameTokens(displayName);
-  if (tokens.length === 0) return true;
-
-  const need = Math.min(2, tokens.length); // was 3
-  let hit = 0;
-  for (const t of tokens) if (text.includes(t)) hit++;
-  if (hit >= need) return true;
-
-  // if overall similarity is high, allow through
-  const simTitle = tokenSim(displayName, haystack.slice(0, 600)); // title/desc chunk
-  return simTitle >= strongSimBoost;
-}
-
-/////////////////////////////
-// AllTrails extractors
-/////////////////////////////
+// ---------- AllTrails scraping ----------
 async function extractParkFromAllTrails(url) {
   const html = await fetchText(url);
   if (!html) return { parkName: null, region: null };
 
   const candidates = new Set();
 
-  // park anchor e.g. /park/us/louisiana/sam-houston-jones-state-park
   const parkAnchor = /https?:\/\/www\.alltrails\.com\/park\/[^"]+\/([a-z0-9\-]+)"/gi;
   let m;
   while ((m = parkAnchor.exec(html)) !== null) {
@@ -294,7 +272,6 @@ async function extractParkFromAllTrails(url) {
     if (slug) candidates.add(slug.replace(/\b\w/g, c => c.toUpperCase()));
   }
 
-  // visible anchor text after park link (fallback)
   const parkAnchorText = /<a[^>]+href="https?:\/\/www\.alltrails\.com\/park\/[^"]+"[^>]*>([^<]{3,120})<\/a>/gi;
   let m2;
   while ((m2 = parkAnchorText.exec(html)) !== null) {
@@ -302,15 +279,12 @@ async function extractParkFromAllTrails(url) {
     if (name && !/alltrails/i.test(name)) candidates.add(name);
   }
 
-  // JSON-LD fallback
   if (candidates.size === 0) {
     const ldjsonRegex = /<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
-    let block;
     let mm;
     while ((mm = ldjsonRegex.exec(html)) !== null) {
-      block = mm[1];
       try {
-        const data = JSON.parse(block);
+        const data = JSON.parse(mm[1]);
         const names = [];
         const crawl = (obj) => {
           if (!obj) return;
@@ -341,9 +315,6 @@ async function extractParkFromAllTrails(url) {
   return { parkName, region };
 }
 
-/////////////////////////////
-// Brave search & logic
-/////////////////////////////
 function buildQueries(displayName, region) {
   const core = `(admission OR "entrance fee" OR "day use" OR day-use OR fee OR fees OR prices OR rates OR pricing OR tarifa OR tarifs OR preise OR prezzi OR precios OR 料金 OR 요금 OR 收费 OR "$")`;
   const withRegion = region ? ` "${region}"` : "";
@@ -351,7 +322,7 @@ function buildQueries(displayName, region) {
     `"${displayName}"${withRegion} ${core}`,
     `${displayName}${withRegion} ${core}`,
     `"${displayName}"${withRegion} (site:.gov OR site:.gov.* OR site:.govt.* OR site:.gouv.* OR site:.go.* OR site:.gob.*) ${core}`,
-    `"${displayName}"${withRegion} (site:.org OR site:.com) (park OR parks OR "national park" OR "state park" OR parc OR parque OR reserve) ${core}`
+    `"${displayName}"${withRegion} (site:.org OR site:.com) (park OR parks OR "state park" OR "national park" OR parc OR parque OR reserve) ${core}`
   ];
 }
 
@@ -369,13 +340,12 @@ export async function handler(event) {
   let { query, state = null, nameForMatch = null } = body;
   if (!query) return ok({ error: "Missing query" });
 
-  // AllTrails support
+  // handle AllTrails
   if (isAllTrailsUrl(query)) {
     const { parkName, region } = await extractParkFromAllTrails(query);
     if (parkName) nameForMatch = parkName;
     if (region && !state) state = region;
     if (!nameForMatch) {
-      // last slug hint
       try {
         const u = new URL(query);
         const parts = u.pathname.split("/").filter(Boolean);
@@ -384,24 +354,19 @@ export async function handler(event) {
     }
   }
 
-  // If the query text itself includes a state, capture it
   if (!state) state = detectStateInString(query);
 
   const displayName = nameForMatch || query;
   const npsIntent = detectNpsIntent(displayName);
 
-  // Region tokens & anti-wrong-state tokens
   let regionTokens = normalizeRegionTokens(state);
   let otherStateTokens = regionTokens.length ? otherUsStateTokens(regionTokens) : [];
 
-  // Build initial query list
   let qList = buildQueries(displayName, regionTokens[1] || regionTokens[0] || null);
 
   try {
     const seenTop = [];
-    let bestFallback = null;      // fee-like path fallback
-    let bestHomepage = null;      // plan/visit homepage fallback
-    let bestRoot = null;          // generic official-ish root/section fallback
+    let bestFallback = null;
     let inferredState = null;
 
     const tryBatch = async (queries, requireRegion = false) => {
@@ -412,7 +377,7 @@ export async function handler(event) {
         const data = await sr.json();
         let results = (data.web?.results || []).filter(r => r.url);
 
-        // rank
+        // official-first sorting
         results.sort((a, b) =>
           scoreHost(b.url, displayName, query, npsIntent, regionTokens, otherStateTokens) -
           scoreHost(a.url, displayName, query, npsIntent, regionTokens, otherStateTokens)
@@ -420,7 +385,6 @@ export async function handler(event) {
 
         seenTop.push(...results.slice(0, 10).map(r => r.url));
 
-        // if region unknown, tally states that co-occur
         if (!regionTokens.length) {
           const counts = {};
           for (const r of results.slice(0, 12)) {
@@ -432,15 +396,13 @@ export async function handler(event) {
           if (top && top[1] >= 2) inferredState = top[0];
         }
 
-        // scan pages
         let checks = 0;
         for (const r of results) {
-          if (checks >= 35) break; // PATCH: scan more candidates per query
+          if (checks >= 24) break; // a few more pages than before
           let u; try { u = new URL(r.url); } catch { continue; }
           const host = u.hostname.toLowerCase();
           const path = u.pathname.toLowerCase();
 
-          // coarse name relevance
           const nameMatch = Math.max(
             tokenSim(displayName, r.title || ""),
             tokenSim(displayName, (host + path))
@@ -452,29 +414,15 @@ export async function handler(event) {
           const hay = `${r.title || ""}\n${r.description || ""}\n${r.url}\n${htmlRaw}`;
           const lower = hay.toLowerCase();
 
-          // looser name-token gate (2 tokens OR strong similarity)
-          if (!passesNameTokenGate(hay, displayName, 0.50)) {
-            continue;
-          }
+          if (!passesNameTokenGate(hay, displayName)) continue;
 
-          // Region requirement (if we have one)
           if ((requireRegion || regionTokens.length) && regionTokens.length) {
             const inUrl = regionTokens.some(t => t && (host + path).includes(t));
             const inText = regionTokens.some(t => t && lower.includes(t));
-            if (!inUrl && !inText) {
-              continue;
-            }
-            // PATCH: softer wrong-state check (word/segment boundary)
-            const hp = (host + path).toLowerCase();
-            const wrongStateHit = otherStateTokens.some(t => {
-              if (!t) return false;
-              const re = new RegExp(`(^|[\\W_/\\-])${t}([\\W_/\\-]|$)`, 'i');
-              return re.test(hp);
-            });
-            if (wrongStateHit) continue;
+            if (!inUrl && !inText) continue;
+            if (otherStateTokens.some(t => t && (host + path).includes(t))) continue;
           }
 
-          // Avoid unrelated NPS unit
           if ((host.endsWith("nps.gov") || host === "nps.gov") && path.includes("/planyourvisit/")) {
             const nm = (displayName || "").toLowerCase();
             const titleLower = (r.title || "").toLowerCase();
@@ -489,61 +437,38 @@ export async function handler(event) {
           const hasFeeWord  = hasAny(lower, FEE_TERMS);
           const hasNoFee    = hasAny(lower, NO_FEE_TERMS);
 
-          // PATCH: consider entrance/admission/day-use near fee/fees/required/charge/admission/entry
-          const entranceNearFee = nearEachOther(lower, ENTRANCE_TERMS, ["fee","fees","required","charge","admission","entry"], TEXT_NEAR_GAP);
-
-          // PATCH: specific trust for USFS/BLM text-only mentions
-          const isUSFSorBLM = (host.endsWith("fs.usda.gov") || host.endsWith(".fs.usda.gov") || host === "fs.usda.gov" || host.endsWith("blm.gov") || host === "blm.gov");
-          const usfsBlmTextFee = isUSFSorBLM && /day[- ]?use fee|recreation fee|fee required/i.test(lower);
-
-          // explicit "no fee" near entrance/admission words
+          // No-fee
           if (!hasCurrency && hasNoFee && nearEachOther(lower, NO_FEE_TERMS, ENTRANCE_TERMS, 240)) {
             return { url: r.url, feeInfo: "No fee", kind: "no-fee" };
           }
 
-          // general/parking fee:
-          //  - currency + (entrance/fee words)
-          //  - OR fee-like path + fee words
-          //  - OR entranceNearFee (text-only)
-          //  - OR USFS/BLM text fee
-          if (
-            (hasCurrency && (hasEntrance || hasFeeWord)) ||
-            (hasFeeWord && looksLikeFeePath(path)) ||
-            entranceNearFee ||
-            usfsBlmTextFee
-          ) {
-            const amt = extractAmount(hay);
-            // crude parking classifier
-            if (/(parking|car park|estacionamiento|aparcamiento)/i.test(lower) && /fee|fees|rate|rates|precio|tarifa|prix|料金|요금|收费|required/i.test(lower)) {
-              return { url: r.url, feeInfo: amt || "Parking fee", kind: "parking" };
+          // Parking vs general:
+          // Parking only if clear parking signals and NOT near entrance/admission
+          const parkingish = looksLikeParkingPath(path) ||
+            /\b(parking|trailhead|parking lot|vehicle fee)\b/i.test(lower);
+
+          const entranceNearby = nearEachOther(lower, ENTRANCE_TERMS, FEE_TERMS, 240);
+
+          if ((hasCurrency || hasFeeWord || looksLikeFeePath(path))) {
+            if (parkingish && !entranceNearby) {
+              const amt = extractAmount(hay) || "Parking fee";
+              return { url: r.url, feeInfo: amt, kind: "parking" };
             }
-            return { url: r.url, feeInfo: amt || "Fee charged", kind: "general" };
+            const amt = extractAmount(hay);
+            const feeInfo = amt ? amt : "Fee charged";
+            return { url: r.url, feeInfo, kind: "general" };
           }
 
-          // remember potential fallbacks
           if (!bestFallback && looksLikeFeePath(path)) {
             bestFallback = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
-          }
-          if (!bestHomepage && looksLikeHomepagePlanVisit(path)) {
-            bestHomepage = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
-          }
-
-          // PATCH: generic official-ish root/section fallback (catch-all)
-          const isOfficialish = /\.gov(\.[a-z]{2})?$/.test(host)
-            || host.endsWith('.nps.gov') || host.endsWith('.fs.usda.gov') || host.endsWith('usda.gov') || host.endsWith('blm.gov')
-            || /(stateparks|parks\.state\.|parkandrec|botanicalgarden|conservancy|trust|preserve|lastateparks|floridastateparks|ncparks|tpwd|parks\.ca\.gov)/i.test(host);
-          if (!bestRoot && isOfficialish) {
-            bestRoot = { url: r.url, feeInfo: "Not verified", kind: "not-verified" };
           }
         }
       }
       return null;
     };
 
-    // Pass 1
     let found = await tryBatch(qList, false);
 
-    // If we inferred a state and none provided, re-run strictly with it
     if (!found && inferredState && !regionTokens.length) {
       regionTokens = normalizeRegionTokens(inferredState);
       otherStateTokens = otherUsStateTokens(regionTokens);
@@ -553,8 +478,6 @@ export async function handler(event) {
 
     if (found) return ok(found);
     if (bestFallback) return ok({ ...bestFallback });
-    if (bestHomepage) return ok({ ...bestHomepage });
-    if (bestRoot) return ok({ ...bestRoot }); // PATCH: ensure at least an official-ish URL
     return ok({ url: null, feeInfo: "Not verified", kind: "not-verified" });
 
   } catch (e) {
